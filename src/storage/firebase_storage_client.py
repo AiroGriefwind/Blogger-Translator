@@ -1,0 +1,32 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from google.cloud import storage
+
+
+class FirebaseStorageClient:
+    def __init__(self, bucket_name: str):
+        self.client = storage.Client()
+        self.bucket = self.client.bucket(bucket_name)
+
+    def upload_json(self, blob_path: str, payload: dict[str, Any]) -> str:
+        blob = self.bucket.blob(blob_path)
+        blob.upload_from_string(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            content_type="application/json",
+        )
+        return f"gs://{self.bucket.name}/{blob_path}"
+
+    def upload_text(self, blob_path: str, text: str) -> str:
+        blob = self.bucket.blob(blob_path)
+        blob.upload_from_string(text, content_type="text/plain; charset=utf-8")
+        return f"gs://{self.bucket.name}/{blob_path}"
+
+    def upload_file(self, blob_path: str, local_file: str | Path) -> str:
+        blob = self.bucket.blob(blob_path)
+        blob.upload_from_filename(str(local_file))
+        return f"gs://{self.bucket.name}/{blob_path}"
+

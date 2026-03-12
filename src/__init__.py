@@ -1,0 +1,2 @@
+"""Blogger Translator source package."""
+

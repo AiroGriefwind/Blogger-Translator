@@ -1,0 +1,10 @@
+{
+  "bastillepost": {
+    "title": "h1.entry-title, h1.post-title, article h1",
+    "time": "time.entry-date, .post-meta time, .entry-date",
+    "author": ".author-name, .post-author, .entry-author, .author",
+    "article_root": "article .entry-content, article .post-content, .single-content, .entry-content",
+    "paragraphs": "p",
+    "caption_nodes": "p.caption, p[class*='caption'], a.image-lightbox[data-caption], img[alt]"
+  }
+}
