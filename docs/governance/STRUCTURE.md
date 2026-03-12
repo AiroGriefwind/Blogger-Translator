@@ -26,3 +26,13 @@ Blogger Translator/
 - 运行编排统一由 `src/pipeline/orchestrator.py` 进入。
 - 每个功能分支都维护并更新 `docs/governance/*`。
 
+## Worktree 目录约定
+
+- `../wt-streamlit`
+- `../wt-firebase-storage`
+- `../wt-scraper`
+- `../wt-translator`
+- `../wt-verifier`
+- `../wt-revisor`
+- `../wt-formatter`
+
