@@ -57,9 +57,12 @@ class BastilleScraper:
 
     def parse(self, url: str, html: str) -> ScrapedArticle:
         soup = BeautifulSoup(html, "html.parser")
-        title = self._pick_text(soup, self.selectors["title"])
-        published_at = self._pick_text(soup, self.selectors["time"])
-        author = self._pick_text(soup, self.selectors["author"])
+        ldjson = self._extract_ldjson(soup)
+        title = self._pick_text(soup, self.selectors["title"]) or ldjson.get("headline", "")
+        published_at = self._pick_text(soup, self.selectors["time"]) or ldjson.get(
+            "datePublished", ""
+        )
+        author = self._pick_text(soup, self.selectors["author"]) or self._ldjson_author(ldjson)
 
         article_root = soup.select_one(self.selectors["article_root"])
         body_paragraphs = self._extract_paragraphs(article_root)
@@ -76,6 +79,7 @@ class BastilleScraper:
             scrape_meta={
                 "paragraph_count": len(body_paragraphs),
                 "caption_count": len(captions),
+                "used_ldjson_fallback": bool(ldjson),
             },
         )
 
@@ -110,24 +114,54 @@ class BastilleScraper:
 
     @staticmethod
     def _extract_captions(article_root: Tag | None, soup: BeautifulSoup) -> list[str]:
-        root = article_root if article_root else soup
         results: list[str] = []
         seen: set[str] = set()
+        roots = [article_root] if article_root else []
+        roots.append(soup)
 
-        for node in root.select("a.image-lightbox[data-caption], p.caption, p[class*='caption']"):
-            text = ""
-            if node.has_attr("data-caption"):
-                text = node["data-caption"].strip()
-            else:
-                text = node.get_text(" ", strip=True)
-            if text and text not in seen:
-                seen.add(text)
-                results.append(text)
+        for root in roots:
+            if root is None:
+                continue
+            for node in root.select("a.image-lightbox[data-caption], p.caption, p[class*='caption']"):
+                text = ""
+                if node.has_attr("data-caption"):
+                    text = node["data-caption"].strip()
+                else:
+                    text = node.get_text(" ", strip=True)
+                if text and text not in seen:
+                    seen.add(text)
+                    results.append(text)
 
-        for img in root.select("img[alt]"):
-            alt_text = (img.get("alt") or "").strip()
+        for anchor in soup.select("a.image-lightbox"):
+            alt_text = ""
+            if anchor.has_attr("data-caption"):
+                alt_text = (anchor.get("data-caption") or "").strip()
+            if not alt_text:
+                img = anchor.select_one("img[alt]")
+                if img:
+                    alt_text = (img.get("alt") or "").strip()
             if alt_text and alt_text not in seen:
                 seen.add(alt_text)
                 results.append(alt_text)
         return results
+
+    @staticmethod
+    def _extract_ldjson(soup: BeautifulSoup) -> dict[str, Any]:
+        for script in soup.select('script[type="application/ld+json"]'):
+            try:
+                data = json.loads(script.get_text())
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict) and data.get("@type") in {"NewsArticle", "Article"}:
+                return data
+        return {}
+
+    @staticmethod
+    def _ldjson_author(ldjson: dict[str, Any]) -> str:
+        author = ldjson.get("author")
+        if isinstance(author, dict):
+            return str(author.get("name", "")).strip()
+        if isinstance(author, list) and author and isinstance(author[0], dict):
+            return str(author[0].get("name", "")).strip()
+        return ""
 
