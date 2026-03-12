@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 
 HEADERS = {
@@ -109,6 +109,8 @@ class BastilleScraper:
                 continue
             if "caption" in css.lower():
                 continue
+            if BastilleScraper._is_disclaimer_text(text):
+                continue
             results.append(text)
         return results
 
@@ -116,34 +118,54 @@ class BastilleScraper:
     def _extract_captions(article_root: Tag | None, soup: BeautifulSoup) -> list[str]:
         results: list[str] = []
         seen: set[str] = set()
-        roots = [article_root] if article_root else []
-        roots.append(soup)
 
-        for root in roots:
-            if root is None:
+        # 先提取正文容器内的 captions。
+        if article_root:
+            for node in article_root.select("a.image-lightbox[data-caption], p.caption, p[class*='caption']"):
+                BastilleScraper._append_caption(node=node, seen=seen, results=results)
+
+        # 再从正文后序扫描，直到“往下看更多文章”为止，避免误抓下一篇文章内容。
+        iterator = article_root.next_elements if article_root else soup.descendants
+        for elem in iterator:
+            if isinstance(elem, NavigableString):
+                if "往下看更多文章" in str(elem):
+                    break
                 continue
-            for node in root.select("a.image-lightbox[data-caption], p.caption, p[class*='caption']"):
-                text = ""
-                if node.has_attr("data-caption"):
-                    text = node["data-caption"].strip()
-                else:
-                    text = node.get_text(" ", strip=True)
-                if text and text not in seen:
-                    seen.add(text)
-                    results.append(text)
-
-        for anchor in soup.select("a.image-lightbox"):
-            alt_text = ""
-            if anchor.has_attr("data-caption"):
-                alt_text = (anchor.get("data-caption") or "").strip()
-            if not alt_text:
-                img = anchor.select_one("img[alt]")
-                if img:
-                    alt_text = (img.get("alt") or "").strip()
-            if alt_text and alt_text not in seen:
-                seen.add(alt_text)
-                results.append(alt_text)
+            if not isinstance(elem, Tag):
+                continue
+            if elem.name == "h3" and "往下看更多文章" in elem.get_text(" ", strip=True):
+                break
+            if elem.name == "a" and "image-lightbox" in (elem.get("class") or []):
+                BastilleScraper._append_caption(node=elem, seen=seen, results=results)
+            elif elem.name == "p":
+                css = " ".join(elem.get("class", []))
+                if "caption" in css.lower():
+                    BastilleScraper._append_caption(node=elem, seen=seen, results=results)
         return results
+
+    @staticmethod
+    def _append_caption(node: Tag, seen: set[str], results: list[str]) -> None:
+        text = ""
+        if node.has_attr("data-caption"):
+            text = (node.get("data-caption") or "").strip()
+        if not text:
+            text = node.get_text(" ", strip=True)
+        if not text and node.name == "a":
+            img = node.select_one("img[alt]")
+            if img:
+                text = (img.get("alt") or "").strip()
+        if not text:
+            return
+        if BastilleScraper._is_disclaimer_text(text):
+            return
+        if text not in seen:
+            seen.add(text)
+            results.append(text)
+
+    @staticmethod
+    def _is_disclaimer_text(text: str) -> bool:
+        normalized = text.replace("*", "").replace(" ", "")
+        return "博客文章文責自負" in normalized and "不代表本公司立場" in normalized
 
     @staticmethod
     def _extract_ldjson(soup: BeautifulSoup) -> dict[str, Any]:
