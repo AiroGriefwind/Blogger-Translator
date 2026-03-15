@@ -13,6 +13,7 @@ PROMPT_FILE = Path(__file__).resolve().parents[1] / "config" / "prompts" / "Tran
 @dataclass
 class TranslateStage:
     client: SiliconFlowClient
+    temperature: float = 0.2
 
     def run(self, article: dict) -> dict:
         system_prompt = PROMPT_FILE.read_text(encoding="utf-8")
@@ -21,7 +22,11 @@ class TranslateStage:
             "请按系统提示翻译以下文章。输出完整英文翻译与 captions，并附名字核对问题列表。\n\n"
             f"{source_text}"
         )
-        content = self.client.chat(system_prompt=system_prompt, user_prompt=user_prompt)
+        content = self.client.chat(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=self.temperature,
+        )
         return {
             "source_url": article.get("url", ""),
             "model": self.client.model,

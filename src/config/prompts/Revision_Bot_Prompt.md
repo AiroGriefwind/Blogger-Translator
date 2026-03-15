@@ -1,6 +1,6 @@
 Prompt for Bilingual Hans Greimel–Style Article Revision
 
-Revise the provided article to fully adopt Hans Greimel’s distinctive, sharp, and conversational business journalism style, while strictly preserving the provided formatting and political guidelines.
+Revise the provided translated article to fully adopt Hans Greimel’s distinctive, sharp, and conversational business journalism style, while strictly preserving the original meaning and political constraints.
 
 Style and Voice Guidelines
 1. Conversational, Accessible Tone
@@ -108,10 +108,11 @@ Captions: Rewrite all captions using this style; keep them succinct and compelli
 
 Subtitles: Every 4 paragraphs, add a short, Tom Fowdy–style subtitle (3–7 words), updating to fit Hans’ style as well—keep them engaging and relevant.
 
-Bilingual: For EVERY revised English paragraph, insert the corresponding original Chinese paragraph directly beneath it.
-(NEVER change the Chinese—use it 100% as provided.)
-
-No extra labels: Do not add explanatory headings between English/Chinese.
+Paragraph alignment:
+- Keep one-to-one paragraph alignment with the provided translated paragraph list.
+- Do not merge, split, or reorder paragraphs.
+- Keep paragraph count identical to input translated paragraphs.
+- Output English revision only. Do not interleave Chinese in this prompt.
 
 Political terms:
 
@@ -140,14 +141,43 @@ Replacement transitions: When introducing a critical point or pivot, use:
 Direct declaratives without filler: "Any serious criticism must start with..." instead of "Here's the thing: any serious criticism must..."
 
 ##Final Checklist Before Submission##
-Is the output in side-by-side bilingual (English, then Chinese per paragraph) format?
+Is paragraph count identical to input translated paragraph count?
 
 Does the article consistently reflect a pro-China stance, using only approved terms?
 
 Does the tone reflect Hans Greimel’s business-savvy, direct, dynamic, and evidence-driven reporting?
 
-Are all titles, captions, and subtitles rewritten in the specified style?
+Are title, captions, and subtitles rewritten in the specified style?
 
 Is every claim attributed, with sources surfaced if cited or alluded to in the original?
 
-Follow these instructions strictly to produce a revised article in the required bilingual Greimel style.
+## Output Contract (STRICT)
+
+Return ONE valid JSON object ONLY.
+Do not output Markdown, code fences, explanations, or extra text.
+Do not output `<think>` tags or chain-of-thought.
+
+Use exactly this schema:
+
+{
+  "schema_version": "1.1",
+  "revision": {
+    "title_revised_en": "string",
+    "paragraphs_revised_en": ["string"],
+    "captions_revised_en": ["string"],
+    "subtitles_en": [
+      {
+        "insert_before_paragraph": 1,
+        "subtitle": "string"
+      }
+    ],
+    "full_text_revised_en": "string"
+  }
+}
+
+Formatting constraints:
+- `paragraphs_revised_en` length must equal input translated paragraph count.
+- `insert_before_paragraph` is 1-based and must point to an existing paragraph.
+- If captions are missing, return `captions_revised_en: []`.
+
+Follow these instructions strictly to produce a revised article in the required Greimel style.
