@@ -19,7 +19,7 @@ class TranslateStage:
         system_prompt = PROMPT_FILE.read_text(encoding="utf-8")
         source_text = self._compose_source_payload(article)
         user_prompt = (
-            "请按系统提示翻译以下文章。输出完整英文翻译与 captions，并附名字核对问题列表。\n\n"
+            "请按系统提示翻译以下文章。仅输出翻译 JSON（包含 paragraphs_en 与 captions）。\n\n"
             f"{source_text}"
         )
         content = self.client.chat(

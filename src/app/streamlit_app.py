@@ -142,7 +142,7 @@ if run_all or run_scraper_only or run_until_translator:
 st.markdown("### 阶段状态")
 _render_stage_board(st.session_state.get("pipeline_stage_states", {}))
 
-tabs = st.tabs(["抓取", "翻译", "核对问题", "润色", "产物归档", "日志错误"])
+tabs = st.tabs(["抓取", "翻译", "核验结果", "润色", "产物归档", "日志错误"])
 outputs = st.session_state.get("pipeline_stage_outputs", {})
 artifacts = st.session_state.get("pipeline_artifacts", {})
 error_payload = st.session_state.get("pipeline_error")
@@ -178,12 +178,68 @@ with tabs[1]:
 
 with tabs[2]:
     st.subheader("Verifier 结果")
-    questions = outputs.get("name_questions", [])
-    if questions:
-        for idx, q in enumerate(questions, start=1):
-            st.write(f"{idx}. {q}")
+    verifier_output = outputs.get("verifier", {})
+    if verifier_output:
+        summary = verifier_output.get("summary", {})
+        c1, c2, c3 = st.columns(3)
+        c1.metric("实体总数", int(summary.get("total_entities", 0)))
+        c2.metric("已确认", int(summary.get("verified_entities", 0)))
+        c3.metric("未确认", int(summary.get("unresolved_entities", 0)))
+
+        notes = verifier_output.get("alignment_notes", [])
+        if notes:
+            with st.expander("段落对齐说明"):
+                st.json(notes)
+
+        paragraph_results = verifier_output.get("paragraph_results", [])
+        if paragraph_results:
+            for item in paragraph_results:
+                paragraph_id = item.get("paragraph_id", "")
+                with st.expander(f"段落 {paragraph_id}"):
+                    st.caption("原文（中文）")
+                    st.write(item.get("zh", ""))
+                    st.caption("译文（英文）")
+                    st.write(item.get("en", ""))
+
+                    verified_entities = item.get("verified_entities", [])
+                    if not verified_entities:
+                        st.info("该段未识别到需要核验的实体。")
+                        continue
+
+                    for entity in verified_entities:
+                        entity_zh = entity.get("entity_zh", "")
+                        entity_en = entity.get("entity_en", "")
+                        entity_type = entity.get("type", "other")
+                        status = "已确认" if entity.get("is_verified", False) else "未确认"
+                        st.markdown(f"**{entity_zh} / {entity_en}** ({entity_type}) - {status}")
+                        if entity.get("final_recommendation"):
+                            st.write(f"建议：{entity.get('final_recommendation')}")
+                        if entity.get("uncertainty_reason"):
+                            st.warning(f"未确认原因：{entity.get('uncertainty_reason')}")
+                        queries = entity.get("next_search_queries", [])
+                        if queries:
+                            st.caption(f"下一步检索建议：{', '.join(str(q) for q in queries)}")
+                        sources = entity.get("sources", [])
+                        if sources:
+                            for src in sources:
+                                url = src.get("url", "")
+                                site = src.get("site", "")
+                                note = src.get("evidence_note", "")
+                                st.markdown(f"- [{site or url}]({url})")
+                                if note:
+                                    st.caption(f"证据说明：{note}")
+                        else:
+                            st.caption("未返回可点击证据链接。")
+        else:
+            st.info("暂无逐段核验结果。")
     else:
-        st.info("暂无核对问题。")
+        questions = outputs.get("name_questions", [])
+        if questions:
+            st.info("当前展示兼容模式结果（旧格式）。")
+            for idx, q in enumerate(questions, start=1):
+                st.write(f"{idx}. {q}")
+        else:
+            st.info("暂无核验结果。")
 
 with tabs[3]:
     st.subheader("Revisor 结果")
@@ -238,6 +294,7 @@ with tabs[5]:
                     "docx_local_path": artifacts.get("docx_local_path", ""),
                     "docx_cloud_path": artifacts.get("docx_cloud_path", ""),
                     "name_questions": outputs.get("name_questions", []),
+                    "verifier": outputs.get("verifier", {}),
                 },
                 ensure_ascii=False,
                 indent=2,

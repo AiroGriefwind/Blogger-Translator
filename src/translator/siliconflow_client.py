@@ -59,5 +59,9 @@ class SiliconFlowClient:
     @staticmethod
     def _sanitize_output(content: str) -> str:
         # 部分推理模型会返回 <think>...</think>，UI 默认不展示该部分。
-        return re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL).strip()
+        cleaned = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL).strip()
+        # 某些模型可能只返回 </think> 结尾标签，前面是可见推理文本。
+        if "</think>" in cleaned:
+            cleaned = cleaned.split("</think>")[-1].strip()
+        return cleaned
 
