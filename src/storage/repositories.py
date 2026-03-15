@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 from storage.firebase_storage_client import FirebaseStorageClient
 
@@ -32,6 +33,10 @@ class RunRepository:
 
     def save_log(self, run_id: str, name: str, payload: dict) -> str:
         return self.storage.upload_json(f"runs/{run_id}/logs/{name}.json", payload)
+
+    def save_run_log(self, date_key: str, run_id: str, payload: dict[str, Any]) -> str:
+        payload["saved_at"] = _utc_now()
+        return self.storage.upload_json(f"logs/{date_key}/{run_id}.json", payload)
 
     def save_output_docx(self, run_id: str, local_docx_path: str) -> str:
         return self.storage.upload_file(f"runs/{run_id}/output/final.docx", local_docx_path)

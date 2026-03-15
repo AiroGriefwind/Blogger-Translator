@@ -49,6 +49,24 @@
 - 对接后端长度控制真实输出字段并在 UI 增加规则命中可视化。
 - 将分阶段错误日志统一落到 Storage `runs/{run_id}/logs/`。
 
+## 2026-03-15（Firebase Storage Logs）
+
+日期时间：2026-03-15  
+分支：`feature/firebase-storage`  
+完成项：
+- 新增运行日志归档接口：`RunRepository.save_run_log(date_key, run_id, payload)`，固定写入 `logs/{yyyymmdd}/{run_id}.json`。
+- 在 `PipelineOrchestrator.run()` 接入分阶段状态追踪（`scrape/translate/verify/revise/format/upload`）。
+- 统一阶段状态字段：`pending/running/success/failed/skipped`，并记录每步起止时间、耗时与错误类型/消息。
+- 使用 `try/except/finally` 保证运行成功或失败都会落一份 run log JSON 到 Storage。
+- 更新 `scripts/smoke_storage.py`，改为验证 run log 路径规范 `logs/{yyyymmdd}/{run_id}.json`。  
+验证结果：
+- 本地静态检查通过（新增文件无 lints）。
+- 脚本可执行到凭据前置校验；当凭据路径正确时可直接用于验证日志上传路径规范。  
+阻塞项：
+- 若 `.env` 中 `GOOGLE_APPLICATION_CREDENTIALS` 不是本机真实路径，Storage 上传会失败。  
+下一步：
+- 在 Streamlit 阶段状态面板对接该 run log JSON，支持按步骤展示失败原因与耗时。
+
 ## 记录模板
 
 ```
