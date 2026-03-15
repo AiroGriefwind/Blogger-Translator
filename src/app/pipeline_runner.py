@@ -10,6 +10,7 @@ from typing import Callable
 from app.mock_pipeline import (
     build_mock_docx,
     build_mock_name_questions,
+    build_mock_verifier_output,
     build_mock_revised,
     build_mock_scraped,
     build_mock_translated,
@@ -24,7 +25,7 @@ from storage.firebase_storage_client import FirebaseStorageClient
 from storage.repositories import RunRepository
 from translator.siliconflow_client import SiliconFlowClient
 from translator.translate_stage import TranslateStage
-from verifier.name_extractor import NameExtractor
+from verifier.verify_stage import VerifyStage
 
 
 @dataclass
@@ -69,8 +70,9 @@ class PipelineRunner:
             stage_outputs["translated"] = translated
             self._maybe_stop("translator", should_stop_after, stage_states)
 
-            questions = self._run_verifier(scraped, translated, emit, options.mock_fail_stage)
-            stage_outputs["name_questions"] = questions
+            verifier_output = self._run_verifier(scraped, translated, options, emit)
+            stage_outputs["verifier"] = verifier_output
+            stage_outputs["name_questions"] = self._build_compat_name_questions(verifier_output)
             self._maybe_stop("verifier", should_stop_after, stage_states)
 
             revised = self._run_revisor(scraped, translated, options, emit)
@@ -84,7 +86,7 @@ class PipelineRunner:
             self._maybe_stop("formatter", should_stop_after, stage_states)
 
             cloud_path = self._run_storage(
-                run_id, scraped, translated, revised, questions, output_file, options, emit
+                run_id, scraped, translated, revised, verifier_output, output_file, options, emit
             )
             artifacts["docx_cloud_path"] = cloud_path
         except StopIteration:
@@ -114,6 +116,7 @@ class PipelineRunner:
                 "docx_local_path": artifacts.get("docx_local_path", ""),
                 "docx_cloud_path": artifacts.get("docx_cloud_path", ""),
                 "name_questions": stage_outputs.get("name_questions", []),
+                "verifier": stage_outputs.get("verifier", {}),
             },
         }
 
@@ -170,19 +173,30 @@ class PipelineRunner:
         return translated
 
     def _run_verifier(
-        self, scraped: dict, translated: dict, emit: Callable, fail_stage: str
-    ) -> list[str]:
-        emit("verifier", "running", "正在生成人名核对问题...")
-        self._maybe_fail("verifier", fail_stage)
-        original_text = "\n".join(scraped.get("body_paragraphs", []))
-        translated_text = translated.get("translated_text", "")
-        questions = NameExtractor().extract_questions(
-            original_text=original_text, translated_text=translated_text
-        )
-        if not questions:
-            questions = build_mock_name_questions()
-        emit("verifier", "success", f"生成 {len(questions)} 条问题")
-        return questions
+        self, scraped: dict, translated: dict, options: RunnerOptions, emit: Callable
+    ) -> dict:
+        emit("verifier", "running", "正在执行联网实体核验...")
+        self._maybe_fail("verifier", options.mock_fail_stage)
+        if options.use_real_llm:
+            env = self._load_runtime_env()
+            self._validate_llm_env(env)
+            client = SiliconFlowClient(
+                api_key=env["SILICONFLOW_API_KEY"],
+                base_url=env["SILICONFLOW_BASE_URL"],
+                model=env["SILICONFLOW_MODEL"],
+                timeout=env["SILICONFLOW_TIMEOUT_SECONDS"],
+                max_retries=env["SILICONFLOW_MAX_RETRIES"],
+            )
+            verifier_output = VerifyStage(client, temperature=env["SILICONFLOW_TEMPERATURE"]).run(
+                scraped, translated
+            )
+            total = int(verifier_output.get("summary", {}).get("total_entities", 0))
+            emit("verifier", "success", f"完成联网核验，共处理 {total} 个实体")
+            return verifier_output
+        verifier_output = build_mock_verifier_output()
+        mock_questions = verifier_output.get("compat_name_questions", build_mock_name_questions())
+        emit("verifier", "mocked", f"使用 mock 核验结果（{len(mock_questions)} 条）")
+        return verifier_output
 
     def _run_revisor(self, scraped: dict, translated: dict, options: RunnerOptions, emit: Callable) -> dict:
         emit("revisor", "running", "正在进行二轮润色...")
@@ -238,7 +252,7 @@ class PipelineRunner:
         scraped: dict,
         translated: dict,
         revised: dict,
-        questions: list[str],
+        verifier_output: dict,
         output_file: Path,
         options: RunnerOptions,
         emit: Callable,
@@ -251,7 +265,12 @@ class PipelineRunner:
             repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
             repo.save_raw_article(run_id, scraped)
             repo.save_translation(run_id, translated)
-            repo.save_log(run_id, "name_questions", {"questions": questions})
+            repo.save_log(run_id, "verifier_entities", verifier_output)
+            repo.save_log(
+                run_id,
+                "name_questions",
+                {"questions": self._build_compat_name_questions(verifier_output)},
+            )
             repo.save_revision(run_id, revised)
             cloud_path = repo.save_output_docx(run_id, str(output_file))
             emit("storage", "success", "已上传到 Firebase Storage")
@@ -328,4 +347,31 @@ class PipelineRunner:
             missing.append("GOOGLE_APPLICATION_CREDENTIALS")
         if missing:
             raise SettingsError(f"真实存储模式缺少环境变量: {', '.join(missing)}")
+
+    @staticmethod
+    def _build_compat_name_questions(verifier_output: dict) -> list[str]:
+        compat = verifier_output.get("compat_name_questions", [])
+        if isinstance(compat, list) and compat:
+            return [str(item) for item in compat]
+
+        questions: list[str] = []
+        paragraph_results = verifier_output.get("paragraph_results", [])
+        if not isinstance(paragraph_results, list):
+            return questions
+
+        for paragraph in paragraph_results:
+            if not isinstance(paragraph, dict):
+                continue
+            pid = paragraph.get("paragraph_id", "")
+            verified_entities = paragraph.get("verified_entities", [])
+            if not isinstance(verified_entities, list):
+                continue
+            for entity in verified_entities:
+                if not isinstance(entity, dict):
+                    continue
+                entity_zh = str(entity.get("entity_zh", "")).strip()
+                entity_en = str(entity.get("entity_en", "")).strip()
+                status = "verified" if entity.get("is_verified", False) else "unverified"
+                questions.append(f"[p{pid}] {entity_zh} / {entity_en} -> {status}")
+        return questions
 

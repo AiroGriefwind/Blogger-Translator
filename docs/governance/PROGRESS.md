@@ -119,6 +119,27 @@
 下一步：
 - 由 verifier 分支接入新 prompt，完成“逐段实体核验结果”写回 UI 的流程实现。
 
+## 2026-03-15（Verifier 全联网核验接入）
+
+日期时间：2026-03-15  
+分支：`feature/verifier`  
+完成项：
+- 新增 `Verifier_Entity_Verify_Prompt`，将“单实体验证”从段落抽取中拆分，要求返回可点击 URL 与证据说明。
+- 重构 `Verifier_Name_Check_Prompt` 为“段落级实体抽取 + 联网证据收集”契约，避免与验证职责混淆。
+- 新增 `ParagraphAligner` / `EntityExtractor` / `EntityVerifier` / `VerifyStage` 四个 verifier 组件，形成“段落对齐 -> 实体抽取 -> 逐实体验证”的串联流程。
+- `pipeline_runner` 与 `orchestrator` 的 verify 阶段改为调用 `VerifyStage`，并落盘 `verifier_entities` 结构化日志。
+- Streamlit 的 verifier 页签改为按“段落 -> 实体 -> 证据 URL”展示，同时保留 `name_questions` 兼容字段。
+- 增加 verifier 契约测试，覆盖 URL 门禁降级与翻译 JSON 解析兜底逻辑。
+验证结果：
+- 代码层已具备“抽取也走 LLM、验证逐实体走 LLM”的双阶段能力。
+- 若验证结果缺失有效 URL，系统会自动将 `is_verified` 降级为 `false` 并补充不确定性说明。
+- UI 可直接查看每个实体的证据链接与证据注释。  
+阻塞项：
+- “模型是否真实联网搜索”依赖上游模型能力与服务端配置，当前代码只能做输出证据门禁，无法强制模型侧联网实现细节。  
+下一步：
+- 在真实联网模型环境下执行端到端联调，验证 Wikipedia 优先策略与 URL 可达性。
+- 按运行数据继续收紧证据域名白名单和质量规则（如来源可信度分级）。
+
 ## 记录模板
 
 ```

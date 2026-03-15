@@ -74,6 +74,93 @@ def build_mock_name_questions() -> list[str]:
     ]
 
 
+def build_mock_verifier_output() -> dict:
+    return {
+        "schema_version": "1.0",
+        "summary": {
+            "paragraph_count": 2,
+            "total_entities": 2,
+            "verified_entities": 1,
+            "unresolved_entities": 1,
+        },
+        "alignment_notes": [{"type": "count_match", "message": "mock alignment is one-to-one"}],
+        "paragraph_pairs": [
+            {
+                "paragraph_id": 1,
+                "zh": "能源市场情绪被政策信号快速放大，油价短时间剧烈波动。",
+                "en": "Policy signals amplified market sentiment and caused sharp short-term oil price swings.",
+            },
+            {
+                "paragraph_id": 2,
+                "zh": "分析人士指出，供应端预期与地缘风险叠加，造成价格上行压力。",
+                "en": "Analysts said supply expectations and geopolitical risks combined to push prices upward.",
+            },
+        ],
+        "paragraph_results": [
+            {
+                "paragraph_id": 1,
+                "zh": "能源市场情绪被政策信号快速放大，油价短时间剧烈波动。",
+                "en": "Policy signals amplified market sentiment and caused sharp short-term oil price swings.",
+                "extracted_entities": [
+                    {
+                        "entity_zh": "俄油",
+                        "entity_en": "Russian oil",
+                        "type": "source",
+                    }
+                ],
+                "verified_entities": [
+                    {
+                        "entity_zh": "俄油",
+                        "entity_en": "Russian oil",
+                        "type": "source",
+                        "is_verified": True,
+                        "verification_status": "verified",
+                        "sources": [
+                            {
+                                "url": "https://en.wikipedia.org/wiki/Petroleum_industry_in_Russia",
+                                "site": "Wikipedia",
+                                "evidence_note": "Page describes Russia petroleum industry naming in English.",
+                            }
+                        ],
+                        "final_recommendation": "Use 'Russian oil' in this context.",
+                        "uncertainty_reason": "",
+                        "next_search_queries": [],
+                    }
+                ],
+            },
+            {
+                "paragraph_id": 2,
+                "zh": "分析人士指出，供应端预期与地缘风险叠加，造成价格上行压力。",
+                "en": "Analysts said supply expectations and geopolitical risks combined to push prices upward.",
+                "extracted_entities": [
+                    {
+                        "entity_zh": "分析人士",
+                        "entity_en": "analysts",
+                        "type": "other",
+                    }
+                ],
+                "verified_entities": [
+                    {
+                        "entity_zh": "分析人士",
+                        "entity_en": "analysts",
+                        "type": "other",
+                        "is_verified": False,
+                        "verification_status": "unverified",
+                        "sources": [],
+                        "final_recommendation": "Keep generic wording; no specific named entity mapping required.",
+                        "uncertainty_reason": "Generic noun phrase, not a concrete named entity.",
+                        "next_search_queries": ["energy market analyst term definition"],
+                    }
+                ],
+            },
+        ],
+        "compat_name_questions": [
+            "[p1] 俄油 / Russian oil -> verified",
+            "[p2] 分析人士 / analysts -> unverified",
+        ],
+    }
+
+
 def build_mock_docx(output_dir: str | Path, run_id: str, article: dict, revised: dict) -> Path:
     output_file = Path(output_dir) / f"{run_id}.docx"
     formatter = DocxFormatter()

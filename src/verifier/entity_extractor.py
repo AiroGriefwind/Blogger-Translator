@@ -1,0 +1,54 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from translator.siliconflow_client import SiliconFlowClient
+
+
+PROMPT_FILE = (
+    Path(__file__).resolve().parents[1]
+    / "config"
+    / "prompts"
+    / "Verifier_Name_Check_Prompt.md"
+)
+
+
+@dataclass
+class EntityExtractor:
+    client: SiliconFlowClient
+    temperature: float = 0.0
+
+    def run(self, paragraph_id: int, zh: str, en: str) -> dict[str, Any]:
+        system_prompt = PROMPT_FILE.read_text(encoding="utf-8")
+        payload = {"paragraph_id": paragraph_id, "zh": zh, "en": en}
+        content = self.client.chat(
+            system_prompt=system_prompt,
+            user_prompt=json.dumps(payload, ensure_ascii=False, indent=2),
+            temperature=self.temperature,
+        )
+        parsed = _parse_json_object(content)
+        entities = parsed.get("entities", [])
+        if not isinstance(entities, list):
+            raise ValueError("Verifier_Name_Check_Prompt 输出缺少 entities 数组")
+        return {
+            "schema_version": str(parsed.get("schema_version", "2.0")),
+            "paragraph_id": int(parsed.get("paragraph_id", paragraph_id)),
+            "entities": entities,
+        }
+
+
+def _parse_json_object(content: str) -> dict[str, Any]:
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`").replace("json", "", 1).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        cleaned = cleaned[start : end + 1]
+    data = json.loads(cleaned)
+    if not isinstance(data, dict):
+        raise ValueError("LLM 返回不是 JSON object")
+    return data

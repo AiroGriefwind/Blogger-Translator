@@ -13,7 +13,7 @@ from storage.firebase_storage_client import FirebaseStorageClient
 from storage.repositories import RunRepository
 from translator.siliconflow_client import SiliconFlowClient
 from translator.translate_stage import TranslateStage
-from verifier.name_extractor import NameExtractor
+from verifier.verify_stage import VerifyStage
 
 
 class PipelineOrchestrator:
@@ -33,7 +33,7 @@ class PipelineOrchestrator:
             self.client, temperature=self.settings.siliconflow_temperature
         )
         self.revisor = RevisionStage(self.client)
-        self.name_extractor = NameExtractor()
+        self.verifier = VerifyStage(self.client, temperature=self.settings.siliconflow_temperature)
         self.formatter = DocxFormatter()
         self.repo = RunRepository(
             FirebaseStorageClient(bucket_name=self.settings.firebase_storage_bucket)
@@ -68,15 +68,13 @@ class PipelineOrchestrator:
 
             active_step = "verify"
             active_step_started_at = self._step_running(run_log, active_step)
-            original_text = "\n".join(scraped.get("body_paragraphs", []))
-            name_questions = self.name_extractor.extract_questions(
-                original_text=original_text,
-                translated_text=translated.get("translated_text", ""),
-            )
+            verifier_output = self.verifier.run(scraped, translated)
             name_questions_uri = self.repo.save_log(
-                run_id, "name_questions", {"questions": name_questions}
+                run_id, "name_questions", {"questions": self._build_compat_name_questions(verifier_output)}
             )
+            verifier_entities_uri = self.repo.save_log(run_id, "verifier_entities", verifier_output)
             run_log["artifacts"]["name_questions_uri"] = name_questions_uri
+            run_log["artifacts"]["verifier_entities_uri"] = verifier_entities_uri
             self._step_success(run_log, active_step, active_step_started_at)
             active_step = None
 
@@ -115,7 +113,8 @@ class PipelineOrchestrator:
                 "run_id": run_id,
                 "docx_local_path": str(output_file),
                 "docx_cloud_path": docx_uri,
-                "name_questions": name_questions,
+                "name_questions": self._build_compat_name_questions(verifier_output),
+                "verifier": verifier_output,
             }
         except Exception as exc:
             if active_step and active_step_started_at:
@@ -166,6 +165,7 @@ class PipelineOrchestrator:
                 "raw_article_uri": None,
                 "translated_uri": None,
                 "name_questions_uri": None,
+                "verifier_entities_uri": None,
                 "revised_uri": None,
                 "docx_local_path": None,
                 "docx_cloud_path": None,
@@ -203,4 +203,27 @@ class PipelineOrchestrator:
         for step in run_log["steps"].values():
             if step["status"] == "pending":
                 step["status"] = "skipped"
+
+    @staticmethod
+    def _build_compat_name_questions(verifier_output: dict[str, Any]) -> list[str]:
+        questions: list[str] = []
+        paragraph_results = verifier_output.get("paragraph_results", [])
+        if not isinstance(paragraph_results, list):
+            return questions
+
+        for paragraph in paragraph_results:
+            if not isinstance(paragraph, dict):
+                continue
+            paragraph_id = paragraph.get("paragraph_id", "")
+            verified_entities = paragraph.get("verified_entities", [])
+            if not isinstance(verified_entities, list):
+                continue
+            for entity in verified_entities:
+                if not isinstance(entity, dict):
+                    continue
+                entity_zh = str(entity.get("entity_zh", "")).strip()
+                entity_en = str(entity.get("entity_en", "")).strip()
+                status = "verified" if entity.get("is_verified", False) else "unverified"
+                questions.append(f"[p{paragraph_id}] {entity_zh} / {entity_en} -> {status}")
+        return questions
 
