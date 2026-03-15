@@ -140,6 +140,27 @@
 - 在真实联网模型环境下执行端到端联调，验证 Wikipedia 优先策略与 URL 可达性。
 - 按运行数据继续收紧证据域名白名单和质量规则（如来源可信度分级）。
 
+## 2026-03-15（Streamlit 接入实体缓存与线上映射）
+
+日期时间：2026-03-15  
+分支：`feature/streamlit`  
+完成项：
+- 新增实体精确 key 归一化规则（`entity_zh|entity_en|type`）与 `entity_map_v1` JSON schema。
+- verifier 阶段新增“同次运行缓存”能力：同一实体后续段落命中缓存后跳过 LLM。
+- verifier 阶段新增“线上映射优先命中”：抽取实体后先查 Firebase Storage 映射，完全一致命中直接复用并跳过 LLM。
+- 新增线上映射读写仓储：支持加载映射、精确查询、按核验结果批量 upsert（附证据 URL 与 run_id）。
+- Streamlit 侧新增两个开关：`核验前查线上映射库（完全一致）`、`将已确认实体写入线上映射库`。
+- UI verifier 展示增加来源状态（如 `db_exact_hit` / `runtime_cache_hit`），并显示写库统计。
+验证结果：
+- 代码静态检查通过：`py_compile`（`streamlit_app.py`、`pipeline_runner.py`、`verify_stage.py`、`repositories.py`、`firebase_storage_client.py`）。
+- verifier 实时日志会记录“DB 命中跳过 LLM / 运行内缓存命中跳过 LLM / 写库完成统计”事件。
+- 在 `执行到核验阶段` 模式下也可触发写库，避免必须跑到 storage 阶段。  
+阻塞项：
+- 当前只实现“完全一致命中”短路，尚未实现“近似匹配候选 + LLM 联合展示”。  
+下一步：
+- 增加近似匹配策略（英文标准化 + 词形归一 + 阈值），并在 UI 展示候选对照与命中解释。
+- 为 entity map 增加并发写入保护（etag/generation）与版本回滚策略。
+
 ## 记录模板
 
 ```

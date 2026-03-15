@@ -20,6 +20,16 @@ class FirebaseStorageClient:
         )
         return f"gs://{self.bucket.name}/{blob_path}"
 
+    def download_json(self, blob_path: str) -> dict[str, Any] | None:
+        blob = self.bucket.blob(blob_path)
+        if not blob.exists():
+            return None
+        data = blob.download_as_text(encoding="utf-8")
+        loaded = json.loads(data)
+        if not isinstance(loaded, dict):
+            raise ValueError(f"JSON blob 不是对象: {blob_path}")
+        return loaded
+
     def upload_text(self, blob_path: str, text: str) -> str:
         blob = self.bucket.blob(blob_path)
         blob.upload_from_string(text, content_type="text/plain; charset=utf-8")
