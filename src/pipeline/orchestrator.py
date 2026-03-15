@@ -26,8 +26,12 @@ class PipelineOrchestrator:
             api_key=self.settings.siliconflow_api_key,
             base_url=self.settings.siliconflow_base_url,
             model=self.settings.siliconflow_model,
+            timeout=self.settings.siliconflow_timeout_seconds,
+            max_retries=self.settings.siliconflow_max_retries,
         )
-        self.translator = TranslateStage(self.client)
+        self.translator = TranslateStage(
+            self.client, temperature=self.settings.siliconflow_temperature
+        )
         self.revisor = RevisionStage(self.client)
         self.name_extractor = NameExtractor()
         self.formatter = DocxFormatter()

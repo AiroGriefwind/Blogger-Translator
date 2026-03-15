@@ -25,6 +25,10 @@ def _env_ready(name: str) -> bool:
     return bool(os.getenv(name, "").strip())
 
 
+def _env_ready_any(*names: str) -> bool:
+    return any(_env_ready(name) for name in names)
+
+
 def _stage_board_markdown(stage_states: dict) -> str:
     icon_map = {
         "pending": "⚪",
@@ -70,7 +74,10 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("环境检查")
-    st.write(f"SILICONFLOW_API_KEY: {'OK' if _env_ready('SILICONFLOW_API_KEY') else 'Missing'}")
+    st.write(
+        "LLM API KEY: "
+        f"{'OK' if _env_ready_any('SILICONFLOW_API_KEY', 'LLM_API_KEY') else 'Missing'}"
+    )
     st.write(f"FIREBASE_STORAGE_BUCKET: {'OK' if _env_ready('FIREBASE_STORAGE_BUCKET') else 'Missing'}")
     st.write(
         "GOOGLE_APPLICATION_CREDENTIALS: "
@@ -80,10 +87,11 @@ with st.sidebar:
 left_col, right_col = st.columns([3, 2])
 with left_col:
     st.subheader("执行区")
-    st.write("支持全流程执行，以及先抓取再继续的分步联调。")
-    btn_col_1, btn_col_2 = st.columns(2)
+    st.write("支持全流程执行，以及先抓取/翻译再继续的分步联调。")
+    btn_col_1, btn_col_2, btn_col_3 = st.columns(3)
     run_all = btn_col_1.button("一键执行全流程", type="primary", use_container_width=True)
     run_scraper_only = btn_col_2.button("仅执行抓取预览", use_container_width=True)
+    run_until_translator = btn_col_3.button("执行到翻译阶段", use_container_width=True)
 
 with right_col:
     st.subheader("占位能力提示")
@@ -92,7 +100,7 @@ with right_col:
 status_placeholder = st.empty()
 status_placeholder.markdown("### 阶段状态\n尚未运行。")
 
-if run_all or run_scraper_only:
+if run_all or run_scraper_only or run_until_translator:
     options = RunnerOptions(
         mode="real" if run_mode == "真实优先" else "mock",
         use_real_scraper=use_real_scraper,
@@ -115,7 +123,11 @@ if run_all or run_scraper_only:
                 output_dir=output_dir,
                 options=options,
                 on_stage_update=on_stage_update,
-                run_until_stage="scraper" if run_scraper_only else None,
+                run_until_stage=(
+                    "scraper"
+                    if run_scraper_only
+                    else ("translator" if run_until_translator else None)
+                ),
             )
         update_from_run_result(result)
         if result.get("ok"):

@@ -157,8 +157,12 @@ class PipelineRunner:
                 api_key=env["SILICONFLOW_API_KEY"],
                 base_url=env["SILICONFLOW_BASE_URL"],
                 model=env["SILICONFLOW_MODEL"],
+                timeout=env["SILICONFLOW_TIMEOUT_SECONDS"],
+                max_retries=env["SILICONFLOW_MAX_RETRIES"],
             )
-            translated = TranslateStage(client).run(scraped)
+            translated = TranslateStage(client, temperature=env["SILICONFLOW_TEMPERATURE"]).run(
+                scraped
+            )
             emit("translator", "success", "真实 LLM 翻译完成")
             return translated
         translated = build_mock_translated(scraped)
@@ -190,6 +194,8 @@ class PipelineRunner:
                 api_key=env["SILICONFLOW_API_KEY"],
                 base_url=env["SILICONFLOW_BASE_URL"],
                 model=env["SILICONFLOW_MODEL"],
+                timeout=env["SILICONFLOW_TIMEOUT_SECONDS"],
+                max_retries=env["SILICONFLOW_MAX_RETRIES"],
             )
             revised = RevisionStage(client).run(scraped, translated)
             revised["placeholder_note"] = "长度控制逻辑已预留，当前仍由下游后端完善。"
@@ -255,22 +261,63 @@ class PipelineRunner:
         return cloud_path
 
     @staticmethod
-    def _load_runtime_env() -> dict[str, str]:
+    def _load_runtime_env() -> dict[str, str | int | float]:
+        api_key = os.getenv("SILICONFLOW_API_KEY", "").strip() or os.getenv(
+            "LLM_API_KEY", ""
+        ).strip()
+        base_url = os.getenv(
+            "SILICONFLOW_BASE_URL", ""
+        ).strip() or os.getenv("LLM_BASE_URL", "https://api.siliconflow.cn/v1").strip()
+        model = os.getenv("SILICONFLOW_MODEL", "").strip() or os.getenv(
+            "LLM_MODEL", "deepseek-r1"
+        ).strip()
+        timeout_seconds = PipelineRunner._read_int_env(
+            "SILICONFLOW_TIMEOUT_SECONDS", "LLM_TIMEOUT_SECONDS", 120
+        )
+        max_retries = PipelineRunner._read_int_env(
+            "SILICONFLOW_MAX_RETRIES", "LLM_MAX_RETRIES", 2
+        )
+        temperature = PipelineRunner._read_float_env(
+            "SILICONFLOW_TEMPERATURE", "LLM_TEMPERATURE", 0.2
+        )
         return {
-            "SILICONFLOW_API_KEY": os.getenv("SILICONFLOW_API_KEY", "").strip(),
-            "SILICONFLOW_BASE_URL": os.getenv("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1").strip(),
-            "SILICONFLOW_MODEL": os.getenv("SILICONFLOW_MODEL", "deepseek-r1").strip(),
+            "SILICONFLOW_API_KEY": api_key,
+            "SILICONFLOW_BASE_URL": base_url,
+            "SILICONFLOW_MODEL": model,
+            "SILICONFLOW_TEMPERATURE": temperature,
+            "SILICONFLOW_TIMEOUT_SECONDS": timeout_seconds,
+            "SILICONFLOW_MAX_RETRIES": max_retries,
             "FIREBASE_STORAGE_BUCKET": os.getenv("FIREBASE_STORAGE_BUCKET", "").strip(),
             "GOOGLE_APPLICATION_CREDENTIALS": os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip(),
         }
 
     @staticmethod
-    def _validate_llm_env(env: dict[str, str]) -> None:
+    def _validate_llm_env(env: dict[str, str | int | float]) -> None:
         missing = []
         if not env["SILICONFLOW_API_KEY"]:
             missing.append("SILICONFLOW_API_KEY")
         if missing:
             raise SettingsError(f"真实翻译模式缺少环境变量: {', '.join(missing)}")
+
+    @staticmethod
+    def _read_int_env(primary_key: str, fallback_key: str, default: int) -> int:
+        raw = os.getenv(primary_key, "").strip() or os.getenv(fallback_key, "").strip()
+        if not raw:
+            return default
+        try:
+            return int(raw)
+        except ValueError as exc:
+            raise SettingsError(f"{primary_key}/{fallback_key} 必须是整数") from exc
+
+    @staticmethod
+    def _read_float_env(primary_key: str, fallback_key: str, default: float) -> float:
+        raw = os.getenv(primary_key, "").strip() or os.getenv(fallback_key, "").strip()
+        if not raw:
+            return default
+        try:
+            return float(raw)
+        except ValueError as exc:
+            raise SettingsError(f"{primary_key}/{fallback_key} 必须是数字") from exc
 
     @staticmethod
     def _validate_storage_env(env: dict[str, str]) -> None:
