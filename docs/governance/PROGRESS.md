@@ -181,6 +181,27 @@
 - 使用 `Claude（模型1）` 在 UI 执行“到核验阶段”完成端到端验证。
 - 视渠道可用性决定是否加入“Gemini 自动回退 Claude”策略，减少联调中断。
 
+## 2026-03-16（Streamlit：Verifier 卡片交互与单实体录入）
+
+日期时间：2026-03-16  
+分支：`feature/streamlit`  
+完成项：
+- Verifier 页签重构为分组展示：`LLM 返回实体卡片`、`db_exact_hit` 折叠区、`runtime_cache_hit` 折叠区。
+- 新增“替换”弹窗：支持输入正确译文、自动检索全文与段落译文命中，并逐条点击确认替换。
+- 新增人名简称命中策略：如 `John Wick` 会同时检索 `John`、`Wick`，覆盖后续简称场景。
+- 新增“录入”弹窗：预填 LLM 结果但可人工编辑，URL 支持 `+/-` 动态增删多条。
+- 新增单实体写库链路：`PipelineRunner.upsert_single_entity_to_online_db` -> `RunRepository.upsert_single_verified_entity`。
+- 新增 `verifier_ui_utils` 与对应测试，覆盖实体分组、候选检索与单实体写库校验。
+验证结果：
+- 测试通过：`pytest -q tests/test_verifier_contract.py tests/test_verifier_ui_utils.py tests/test_repository_entity_map.py`（9 passed）。
+- 语法检查通过：`python -m py_compile src/app/streamlit_app.py src/app/verifier_ui_utils.py src/storage/repositories.py`。
+- lints 检查无新增错误（涉及 `streamlit_app.py`、`pipeline_runner.py`、`repositories.py` 与新增测试文件）。
+阻塞项：
+- 本机环境缺少 `gh` 命令（不在 PATH），无法直接命令行创建 PR，只能使用网页创建/更新 PR。
+下一步：
+- 合并后在真实联网模型环境下跑“执行到核验阶段”，验证替换与录入交互在真实数据下的稳定性。
+- 评估是否引入近似匹配候选（非完全一致）以补充当前 `db_exact_hit` 命中策略。
+
 ## 记录模板
 
 ```
