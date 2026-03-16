@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 import os
 import traceback
+from time import strftime
 from typing import Callable
 
 from app.mock_pipeline import (
@@ -34,7 +35,9 @@ class RunnerOptions:
     use_real_scraper: bool = False
     use_real_llm: bool = False
     use_real_storage: bool = False
+    use_entity_db_lookup: bool = True
     mock_fail_stage: str = ""
+    llm_model: str = ""
 
 
 class PipelineRunner:
@@ -44,6 +47,7 @@ class PipelineRunner:
         output_dir: str | Path,
         options: RunnerOptions,
         on_stage_update: Callable[[str, str, str], None] | None = None,
+        on_verifier_progress: Callable[[dict], None] | None = None,
         run_until_stage: str | None = None,
     ) -> dict:
         if not url.strip():
@@ -54,12 +58,34 @@ class PipelineRunner:
         stage_outputs: dict = {}
         artifacts: dict = {}
         error: dict | None = None
+        runtime = {
+            "verify_progress": {"done": 0, "total": 0, "percent": 0.0},
+            "logs": [],
+        }
         should_stop_after = run_until_stage if run_until_stage in STAGE_ORDER else None
 
         def emit(stage: str, status: str, detail: str) -> None:
             stage_states[stage] = {"status": status, "detail": detail}
             if on_stage_update:
                 on_stage_update(stage, status, detail)
+            runtime["logs"].append(
+                {"time": strftime("%H:%M:%S"), "stage": stage, "message": f"[{status}] {detail}"}
+            )
+
+        def emit_verifier_progress(payload: dict) -> None:
+            done = int(payload.get("done_paragraphs", 0))
+            total = int(payload.get("total_paragraphs", 0))
+            percent = float(payload.get("percent", 0.0))
+            runtime["verify_progress"] = {"done": done, "total": total, "percent": percent}
+            runtime["logs"].append(
+                {
+                    "time": strftime("%H:%M:%S"),
+                    "stage": "verifier",
+                    "message": str(payload.get("message", "")),
+                }
+            )
+            if on_verifier_progress:
+                on_verifier_progress(payload)
 
         try:
             scraped = self._run_scraper(url, options, emit)
@@ -70,7 +96,13 @@ class PipelineRunner:
             stage_outputs["translated"] = translated
             self._maybe_stop("translator", should_stop_after, stage_states)
 
-            verifier_output = self._run_verifier(scraped, translated, options, emit)
+            verifier_output = self._run_verifier(
+                scraped,
+                translated,
+                options,
+                emit,
+                emit_verifier_progress,
+            )
             stage_outputs["verifier"] = verifier_output
             stage_outputs["name_questions"] = self._build_compat_name_questions(verifier_output)
             self._maybe_stop("verifier", should_stop_after, stage_states)
@@ -110,6 +142,7 @@ class PipelineRunner:
             "stage_outputs": stage_outputs,
             "artifacts": artifacts,
             "error": error,
+            "runtime": runtime,
             "finished_at": datetime.utcnow().isoformat(),
             "result": {
                 "run_id": run_id,
@@ -154,7 +187,7 @@ class PipelineRunner:
         emit("translator", "running", "正在进行首轮翻译...")
         self._maybe_fail("translator", options.mock_fail_stage)
         if options.use_real_llm:
-            env = self._load_runtime_env()
+            env = self._load_runtime_env(model_override=options.llm_model)
             self._validate_llm_env(env)
             client = SiliconFlowClient(
                 api_key=env["SILICONFLOW_API_KEY"],
@@ -173,12 +206,17 @@ class PipelineRunner:
         return translated
 
     def _run_verifier(
-        self, scraped: dict, translated: dict, options: RunnerOptions, emit: Callable
+        self,
+        scraped: dict,
+        translated: dict,
+        options: RunnerOptions,
+        emit: Callable,
+        on_verifier_progress: Callable[[dict], None] | None = None,
     ) -> dict:
         emit("verifier", "running", "正在执行联网实体核验...")
         self._maybe_fail("verifier", options.mock_fail_stage)
         if options.use_real_llm:
-            env = self._load_runtime_env()
+            env = self._load_runtime_env(model_override=options.llm_model)
             self._validate_llm_env(env)
             client = SiliconFlowClient(
                 api_key=env["SILICONFLOW_API_KEY"],
@@ -187,13 +225,61 @@ class PipelineRunner:
                 timeout=env["SILICONFLOW_TIMEOUT_SECONDS"],
                 max_retries=env["SILICONFLOW_MAX_RETRIES"],
             )
+            repo: RunRepository | None = None
+            if options.use_entity_db_lookup:
+                self._validate_storage_env(env)
+                repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
+
+            def lookup_exact(entity: dict) -> dict | None:
+                if not repo or not options.use_entity_db_lookup:
+                    return None
+                return repo.find_entity_exact(entity)
+
             verifier_output = VerifyStage(client, temperature=env["SILICONFLOW_TEMPERATURE"]).run(
-                scraped, translated
+                scraped,
+                translated,
+                on_progress=on_verifier_progress,
+                lookup_exact=lookup_exact,
             )
+            if options.use_entity_db_lookup:
+                verifier_output["entity_db"] = {"write_enabled": False}
             total = int(verifier_output.get("summary", {}).get("total_entities", 0))
             emit("verifier", "success", f"完成联网核验，共处理 {total} 个实体")
             return verifier_output
         verifier_output = build_mock_verifier_output()
+        paragraph_results = verifier_output.get("paragraph_results", [])
+        total = len(paragraph_results) if isinstance(paragraph_results, list) else 0
+        if on_verifier_progress:
+            on_verifier_progress(
+                {
+                    "event": "start",
+                    "done_paragraphs": 0,
+                    "total_paragraphs": total,
+                    "percent": 0.0,
+                    "message": f"核验启动，共 {total} 段待处理（mock）",
+                }
+            )
+            for idx, item in enumerate(paragraph_results, start=1):
+                pid = item.get("paragraph_id", idx) if isinstance(item, dict) else idx
+                on_verifier_progress(
+                    {
+                        "event": "paragraph_done",
+                        "done_paragraphs": idx,
+                        "total_paragraphs": total,
+                        "paragraph_id": pid,
+                        "percent": (idx / total * 100.0) if total else 100.0,
+                        "message": f"已完成第 {idx}/{total} 段（段落ID={pid}）（mock）",
+                    }
+                )
+            on_verifier_progress(
+                {
+                    "event": "done",
+                    "done_paragraphs": total,
+                    "total_paragraphs": total,
+                    "percent": 100.0,
+                    "message": f"核验完成，共处理 {total} 段（mock）",
+                }
+            )
         mock_questions = verifier_output.get("compat_name_questions", build_mock_name_questions())
         emit("verifier", "mocked", f"使用 mock 核验结果（{len(mock_questions)} 条）")
         return verifier_output
@@ -202,7 +288,7 @@ class PipelineRunner:
         emit("revisor", "running", "正在进行二轮润色...")
         self._maybe_fail("revisor", options.mock_fail_stage)
         if options.use_real_llm:
-            env = self._load_runtime_env()
+            env = self._load_runtime_env(model_override=options.llm_model)
             self._validate_llm_env(env)
             client = SiliconFlowClient(
                 api_key=env["SILICONFLOW_API_KEY"],
@@ -280,7 +366,7 @@ class PipelineRunner:
         return cloud_path
 
     @staticmethod
-    def _load_runtime_env() -> dict[str, str | int | float]:
+    def _load_runtime_env(model_override: str = "") -> dict[str, str | int | float]:
         api_key = os.getenv("SILICONFLOW_API_KEY", "").strip() or os.getenv(
             "LLM_API_KEY", ""
         ).strip()
@@ -290,6 +376,8 @@ class PipelineRunner:
         model = os.getenv("SILICONFLOW_MODEL", "").strip() or os.getenv(
             "LLM_MODEL", "deepseek-r1"
         ).strip()
+        if model_override.strip():
+            model = model_override.strip()
         timeout_seconds = PipelineRunner._read_int_env(
             "SILICONFLOW_TIMEOUT_SECONDS", "LLM_TIMEOUT_SECONDS", 120
         )
@@ -374,4 +462,10 @@ class PipelineRunner:
                 status = "verified" if entity.get("is_verified", False) else "unverified"
                 questions.append(f"[p{pid}] {entity_zh} / {entity_en} -> {status}")
         return questions
+
+    def write_verified_entities_to_online_db(self, run_id: str, verifier_output: dict) -> dict[str, int]:
+        env = self._load_runtime_env()
+        self._validate_storage_env(env)
+        repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
+        return repo.upsert_verified_entities(run_id=run_id, verifier_output=verifier_output)
 

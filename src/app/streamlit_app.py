@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
@@ -27,6 +28,11 @@ def _env_ready(name: str) -> bool:
 
 def _env_ready_any(*names: str) -> bool:
     return any(_env_ready(name) for name in names)
+
+
+def _env_text(name: str, default: str = "") -> str:
+    raw = os.getenv(name, default)
+    return raw.strip().strip('"').strip("'")
 
 
 def _stage_board_markdown(stage_states: dict) -> str:
@@ -65,6 +71,20 @@ with st.sidebar:
     use_real_scraper = st.checkbox("抓取使用真实请求", value=(run_mode == "真实优先"))
     use_real_llm = st.checkbox("翻译/润色使用真实 LLM", value=(run_mode == "真实优先"))
     use_real_storage = st.checkbox("归档使用真实 Firebase Storage", value=False)
+    use_entity_db_lookup = st.checkbox("核验前查线上映射库（完全一致）", value=True)
+    distill_model = _env_text("LLM_MODEL_B", "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B")
+    primary_model = _env_text(
+        "SILICONFLOW_MODEL",
+        _env_text("LLM_MODEL", "Pro/deepseek-ai/DeepSeek-R1"),
+    )
+    model_labels = ["Distill（默认）", "R1（主模型）"]
+    model_values = {
+        "Distill（默认）": distill_model,
+        "R1（主模型）": primary_model,
+    }
+    selected_model_label = st.selectbox("LLM 模型", options=model_labels, index=0)
+    selected_model = model_values[selected_model_label]
+    st.caption(f"当前将使用：`{selected_model}`")
 
     st.markdown("---")
     mock_fail_stage = st.selectbox("调试：注入失败阶段", options=["无"] + STAGE_ORDER, index=0)
@@ -87,11 +107,12 @@ with st.sidebar:
 left_col, right_col = st.columns([3, 2])
 with left_col:
     st.subheader("执行区")
-    st.write("支持全流程执行，以及先抓取/翻译再继续的分步联调。")
-    btn_col_1, btn_col_2, btn_col_3 = st.columns(3)
+    st.write("支持全流程执行，以及先抓取/翻译/核验再继续的分步联调。")
+    btn_col_1, btn_col_2, btn_col_3, btn_col_4 = st.columns(4)
     run_all = btn_col_1.button("一键执行全流程", type="primary", use_container_width=True)
     run_scraper_only = btn_col_2.button("仅执行抓取预览", use_container_width=True)
     run_until_translator = btn_col_3.button("执行到翻译阶段", use_container_width=True)
+    run_until_verifier = btn_col_4.button("执行到核验阶段", use_container_width=True)
 
 with right_col:
     st.subheader("占位能力提示")
@@ -99,22 +120,86 @@ with right_col:
 
 status_placeholder = st.empty()
 status_placeholder.markdown("### 阶段状态\n尚未运行。")
+progress_placeholder = st.empty()
+progress_text_placeholder = st.empty()
+log_placeholder = st.empty()
 
-if run_all or run_scraper_only or run_until_translator:
+
+def _render_runtime_progress() -> None:
+    verify_progress = st.session_state.get(
+        "pipeline_verify_progress", {"done": 0, "total": 0, "percent": 0.0}
+    )
+    done = int(verify_progress.get("done", 0))
+    total = int(verify_progress.get("total", 0))
+    percent = float(verify_progress.get("percent", 0.0))
+    text = (
+        f"核验进度：{done}/{total} 段"
+        if total > 0
+        else "核验进度：等待开始"
+    )
+    progress_placeholder.progress(min(max(percent / 100.0, 0.0), 1.0))
+    progress_text_placeholder.caption(text)
+
+    runtime_logs = st.session_state.get("pipeline_runtime_logs", [])
+    if runtime_logs:
+        lines = [f"[{item.get('time', '--:--:--')}] {item.get('message', '')}" for item in runtime_logs[-12:]]
+        log_placeholder.markdown("### 实时日志\n" + "\n".join(f"- {line}" for line in lines))
+    else:
+        log_placeholder.markdown("### 实时日志\n- 暂无日志。")
+
+
+_render_runtime_progress()
+
+if run_all or run_scraper_only or run_until_translator or run_until_verifier:
     options = RunnerOptions(
         mode="real" if run_mode == "真实优先" else "mock",
         use_real_scraper=use_real_scraper,
         use_real_llm=use_real_llm,
         use_real_storage=use_real_storage,
+        use_entity_db_lookup=use_entity_db_lookup,
         mock_fail_stage="" if mock_fail_stage == "无" else mock_fail_stage,
+        llm_model=selected_model,
     )
     runner = PipelineRunner()
 
     live_states = st.session_state.get("pipeline_stage_states", {})
+    st.session_state["pipeline_runtime_logs"] = []
+    st.session_state["pipeline_verify_progress"] = {"done": 0, "total": 0, "percent": 0.0}
+    _render_runtime_progress()
 
     def on_stage_update(stage: str, status: str, detail: str) -> None:
         live_states[stage] = {"status": status, "detail": detail}
         status_placeholder.markdown(f"### 阶段状态\n{_stage_board_markdown(live_states)}")
+        logs = st.session_state.get("pipeline_runtime_logs", [])
+        logs.append(
+            {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "stage": stage,
+                "message": f"[{stage}] {detail}",
+            }
+        )
+        st.session_state["pipeline_runtime_logs"] = logs
+        _render_runtime_progress()
+
+    def on_verifier_progress(payload: dict) -> None:
+        done = int(payload.get("done_paragraphs", 0))
+        total = int(payload.get("total_paragraphs", 0))
+        percent = float(payload.get("percent", 0.0))
+        st.session_state["pipeline_verify_progress"] = {
+            "done": done,
+            "total": total,
+            "percent": percent,
+        }
+        logs = st.session_state.get("pipeline_runtime_logs", [])
+        logs.append(
+            {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "stage": "verifier",
+                "message": str(payload.get("message", "")),
+            }
+        )
+        st.session_state["pipeline_runtime_logs"] = logs
+        _render_runtime_progress()
 
     try:
         with st.spinner("正在执行流水线，请稍候..."):
@@ -123,10 +208,15 @@ if run_all or run_scraper_only or run_until_translator:
                 output_dir=output_dir,
                 options=options,
                 on_stage_update=on_stage_update,
+                on_verifier_progress=on_verifier_progress,
                 run_until_stage=(
                     "scraper"
                     if run_scraper_only
-                    else ("translator" if run_until_translator else None)
+                    else (
+                        "translator"
+                        if run_until_translator
+                        else ("verifier" if run_until_verifier else None)
+                    )
                 ),
             )
         update_from_run_result(result)
@@ -180,11 +270,55 @@ with tabs[2]:
     st.subheader("Verifier 结果")
     verifier_output = outputs.get("verifier", {})
     if verifier_output:
+        write_to_db = st.button("确认写入线上映射库", key="write_entity_map_btn")
+        if write_to_db:
+            try:
+                write_stats = PipelineRunner().write_verified_entities_to_online_db(
+                    run_id=run_id,
+                    verifier_output=verifier_output,
+                )
+                verifier_output["entity_db"] = {
+                    "write_enabled": True,
+                    "scanned": int(write_stats.get("scanned", 0)),
+                    "upserted": int(write_stats.get("upserted", 0)),
+                    "entries": int(write_stats.get("entries", 0)),
+                }
+                outputs["verifier"] = verifier_output
+                st.session_state["pipeline_stage_outputs"] = outputs
+                logs = st.session_state.get("pipeline_runtime_logs", [])
+                logs.append(
+                    {
+                        "time": datetime.now().strftime("%H:%M:%S"),
+                        "stage": "verifier",
+                        "message": (
+                            "线上映射库写入完成："
+                            f"扫描 {write_stats.get('scanned', 0)}，"
+                            f"新增/更新 {write_stats.get('upserted', 0)}，"
+                            f"当前总条目 {write_stats.get('entries', 0)}"
+                        ),
+                    }
+                )
+                st.session_state["pipeline_runtime_logs"] = logs
+                _render_runtime_progress()
+                st.success("已按确认写入线上映射库。")
+            except SettingsError as err:
+                st.error(str(err))
+            except Exception as err:  # pragma: no cover
+                st.exception(err)
         summary = verifier_output.get("summary", {})
         c1, c2, c3 = st.columns(3)
         c1.metric("实体总数", int(summary.get("total_entities", 0)))
         c2.metric("已确认", int(summary.get("verified_entities", 0)))
         c3.metric("未确认", int(summary.get("unresolved_entities", 0)))
+        entity_db = verifier_output.get("entity_db", {})
+        if isinstance(entity_db, dict) and entity_db:
+            st.caption(
+                "线上映射库："
+                f"write_enabled={entity_db.get('write_enabled', False)}, "
+                f"scanned={entity_db.get('scanned', 0)}, "
+                f"upserted={entity_db.get('upserted', 0)}, "
+                f"entries={entity_db.get('entries', 0)}"
+            )
 
         notes = verifier_output.get("alignment_notes", [])
         if notes:
@@ -211,7 +345,11 @@ with tabs[2]:
                         entity_en = entity.get("entity_en", "")
                         entity_type = entity.get("type", "other")
                         status = "已确认" if entity.get("is_verified", False) else "未确认"
-                        st.markdown(f"**{entity_zh} / {entity_en}** ({entity_type}) - {status}")
+                        verification_status = str(entity.get("verification_status", "")).strip()
+                        status_suffix = f" | 来源：{verification_status}" if verification_status else ""
+                        st.markdown(
+                            f"**{entity_zh} / {entity_en}** ({entity_type}) - {status}{status_suffix}"
+                        )
                         if entity.get("final_recommendation"):
                             st.write(f"建议：{entity.get('final_recommendation')}")
                         if entity.get("uncertainty_reason"):
@@ -277,6 +415,11 @@ with tabs[5]:
     st.subheader("日志与错误")
     st.write(f"最后执行模式：`{st.session_state.get('pipeline_last_mode', 'unknown')}`")
     st.json(st.session_state.get("pipeline_stage_states", {}))
+    runtime_logs = st.session_state.get("pipeline_runtime_logs", [])
+    if runtime_logs:
+        st.markdown("#### 运行日志")
+        for item in runtime_logs:
+            st.write(f"[{item.get('time', '--:--:--')}] {item.get('message', '')}")
     if error_payload:
         st.error(
             f"失败阶段：{error_payload.get('stage', 'unknown')} | "

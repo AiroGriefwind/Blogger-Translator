@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
+from typing import Callable
 
 from translator.siliconflow_client import SiliconFlowClient
 from verifier.entity_extractor import EntityExtractor
+from verifier.entity_key import build_entity_exact_key
 from verifier.entity_verifier import EntityVerifier
 from verifier.paragraph_aligner import ParagraphAligner
 
@@ -15,7 +18,13 @@ class VerifyStage:
     client: SiliconFlowClient
     temperature: float = 0.0
 
-    def run(self, scraped: dict, translated: dict) -> dict[str, Any]:
+    def run(
+        self,
+        scraped: dict,
+        translated: dict,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+        lookup_exact: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+    ) -> dict[str, Any]:
         zh_paragraphs = self._as_string_list(scraped.get("body_paragraphs", []))
         en_paragraphs = self._extract_translated_paragraphs(translated)
 
@@ -34,15 +43,32 @@ class VerifyStage:
             },
         )
 
+        aligned_pairs = [
+            pair
+            for pair in aligned.get("paragraph_pairs", [])
+            if int(pair.get("paragraph_id", 0)) > 0
+        ]
+        total_paragraphs = len(aligned_pairs)
+        if on_progress:
+            on_progress(
+                {
+                    "event": "start",
+                    "done_paragraphs": 0,
+                    "total_paragraphs": total_paragraphs,
+                    "percent": 0.0,
+                    "message": f"核验启动，共 {total_paragraphs} 段待处理",
+                }
+            )
+
         paragraph_results: list[dict[str, Any]] = []
         total_entities = 0
         verified_entities = 0
         unresolved_entities = 0
+        done_paragraphs = 0
+        run_cache: dict[str, dict[str, Any]] = {}
 
-        for pair in aligned.get("paragraph_pairs", []):
+        for pair in aligned_pairs:
             paragraph_id = int(pair.get("paragraph_id", 0))
-            if paragraph_id <= 0:
-                continue
             zh = str(pair.get("zh", ""))
             en = str(pair.get("en", ""))
 
@@ -53,12 +79,67 @@ class VerifyStage:
             for entity in extracted_entities:
                 if not isinstance(entity, dict):
                     continue
-                verified = verifier.run(
-                    paragraph_id=paragraph_id,
-                    paragraph_zh=zh,
-                    paragraph_en=en,
-                    entity=entity,
-                ).get("entity", {})
+                exact_key = build_entity_exact_key(
+                    str(entity.get("entity_zh", "")),
+                    str(entity.get("entity_en", "")),
+                    str(entity.get("type", "other")),
+                )
+                verified: dict[str, Any] = {}
+                if exact_key in run_cache:
+                    verified = deepcopy(run_cache[exact_key])
+                    verified["verification_status"] = "runtime_cache_hit"
+                    if on_progress:
+                        on_progress(
+                            {
+                                "event": "entity_cached_hit",
+                                "done_paragraphs": done_paragraphs,
+                                "total_paragraphs": total_paragraphs,
+                                "paragraph_id": paragraph_id,
+                                "percent": (
+                                    done_paragraphs / total_paragraphs * 100.0
+                                    if total_paragraphs
+                                    else 100.0
+                                ),
+                                "message": (
+                                    f"段落ID={paragraph_id} 命中运行内缓存，跳过 LLM："
+                                    f"{verified.get('entity_zh', '')} / {verified.get('entity_en', '')}"
+                                ),
+                            }
+                        )
+                else:
+                    if lookup_exact:
+                        db_match = lookup_exact(entity)
+                        if isinstance(db_match, dict):
+                            verified = deepcopy(db_match)
+                            verified["verification_status"] = "db_exact_hit"
+                            if on_progress:
+                                on_progress(
+                                    {
+                                        "event": "entity_db_hit",
+                                        "done_paragraphs": done_paragraphs,
+                                        "total_paragraphs": total_paragraphs,
+                                        "paragraph_id": paragraph_id,
+                                        "percent": (
+                                            done_paragraphs / total_paragraphs * 100.0
+                                            if total_paragraphs
+                                            else 100.0
+                                        ),
+                                        "message": (
+                                            f"段落ID={paragraph_id} 命中线上映射，跳过 LLM："
+                                            f"{verified.get('entity_zh', '')} / {verified.get('entity_en', '')}"
+                                        ),
+                                    }
+                                )
+                    if not verified:
+                        verified = verifier.run(
+                            paragraph_id=paragraph_id,
+                            paragraph_zh=zh,
+                            paragraph_en=en,
+                            entity=entity,
+                        ).get("entity", {})
+                    if isinstance(verified, dict) and verified:
+                        run_cache[exact_key] = deepcopy(verified)
+
                 if not isinstance(verified, dict):
                     continue
                 verified_items.append(verified)
@@ -75,6 +156,32 @@ class VerifyStage:
                     "en": en,
                     "extracted_entities": extracted_entities,
                     "verified_entities": verified_items,
+                }
+            )
+            done_paragraphs += 1
+            if on_progress:
+                percent = (done_paragraphs / total_paragraphs * 100.0) if total_paragraphs else 100.0
+                on_progress(
+                    {
+                        "event": "paragraph_done",
+                        "done_paragraphs": done_paragraphs,
+                        "total_paragraphs": total_paragraphs,
+                        "paragraph_id": paragraph_id,
+                        "percent": percent,
+                        "message": (
+                            f"已完成第 {done_paragraphs}/{total_paragraphs} 段（段落ID={paragraph_id}）"
+                        ),
+                    }
+                )
+
+        if on_progress:
+            on_progress(
+                {
+                    "event": "done",
+                    "done_paragraphs": done_paragraphs,
+                    "total_paragraphs": total_paragraphs,
+                    "percent": 100.0,
+                    "message": f"核验完成，共处理 {done_paragraphs} 段",
                 }
             )
 

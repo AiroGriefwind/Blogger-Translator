@@ -20,6 +20,8 @@ def init_ui_state() -> None:
     st.session_state.setdefault("pipeline_artifacts", {})
     st.session_state.setdefault("pipeline_run_id", "")
     st.session_state.setdefault("pipeline_last_mode", "mock")
+    st.session_state.setdefault("pipeline_verify_progress", {"done": 0, "total": 0, "percent": 0.0})
+    st.session_state.setdefault("pipeline_runtime_logs", [])
 
 
 def reset_pipeline_state() -> None:
@@ -28,6 +30,8 @@ def reset_pipeline_state() -> None:
     st.session_state["pipeline_error"] = None
     st.session_state["pipeline_artifacts"] = {}
     st.session_state["pipeline_run_id"] = ""
+    st.session_state["pipeline_verify_progress"] = {"done": 0, "total": 0, "percent": 0.0}
+    st.session_state["pipeline_runtime_logs"] = []
 
 
 def update_from_run_result(result: dict[str, Any]) -> None:
@@ -39,4 +43,9 @@ def update_from_run_result(result: dict[str, Any]) -> None:
     st.session_state["pipeline_artifacts"] = deepcopy(result.get("artifacts", {}))
     st.session_state["pipeline_run_id"] = str(result.get("run_id", ""))
     st.session_state["pipeline_last_mode"] = str(result.get("mode", "unknown"))
+    runtime = result.get("runtime", {})
+    st.session_state["pipeline_verify_progress"] = deepcopy(
+        runtime.get("verify_progress", {"done": 0, "total": 0, "percent": 0.0})
+    )
+    st.session_state["pipeline_runtime_logs"] = deepcopy(runtime.get("logs", []))
 
