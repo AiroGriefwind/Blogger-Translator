@@ -484,3 +484,8 @@ class PipelineRunner:
         repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
         return repo.upsert_verified_entities(run_id=run_id, verifier_output=verifier_output)
 
+    def upsert_single_entity_to_online_db(self, run_id: str, entity: dict) -> dict[str, int]:
+        env = self._load_runtime_env()
+        self._validate_storage_env(env)
+        repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
+        return repo.upsert_single_verified_entity(run_id=run_id, entity=entity)
