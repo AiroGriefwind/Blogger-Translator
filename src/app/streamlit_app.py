@@ -72,15 +72,20 @@ with st.sidebar:
     use_real_llm = st.checkbox("翻译/润色使用真实 LLM", value=(run_mode == "真实优先"))
     use_real_storage = st.checkbox("归档使用真实 Firebase Storage", value=False)
     use_entity_db_lookup = st.checkbox("核验前查线上映射库（完全一致）", value=True)
-    distill_model = _env_text("LLM_MODEL_B", "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B")
-    primary_model = _env_text(
-        "SILICONFLOW_MODEL",
-        _env_text("LLM_MODEL", "Pro/deepseek-ai/DeepSeek-R1"),
+    claude_model = _env_text(
+        "MAYNOR_MODEL_A",
+        _env_text("MAYNOR_MODEL_CLAUDE", "claude-sonnet-4-6-thinking"),
     )
-    model_labels = ["Distill（默认）", "R1（主模型）"]
+    gemini_model = _env_text(
+        "MAYNOR_MODEL_B",
+        _env_text("MAYNOR_MODEL_GEMINI", "gemini-3.1-pro-preview"),
+    )
+    maynor_model = _env_text("MAYNOR_MODEL", claude_model)
+    model_labels = ["Claude（模型1）", "Gemini（模型2）", "Maynor（自定义）"]
     model_values = {
-        "Distill（默认）": distill_model,
-        "R1（主模型）": primary_model,
+        "Claude（模型1）": claude_model,
+        "Gemini（模型2）": gemini_model,
+        "Maynor（自定义）": maynor_model,
     }
     selected_model_label = st.selectbox("LLM 模型", options=model_labels, index=0)
     selected_model = model_values[selected_model_label]
@@ -96,7 +101,7 @@ with st.sidebar:
     st.subheader("环境检查")
     st.write(
         "LLM API KEY: "
-        f"{'OK' if _env_ready_any('SILICONFLOW_API_KEY', 'LLM_API_KEY') else 'Missing'}"
+        f"{'OK' if _env_ready_any('SILICONFLOW_API_KEY', 'LLM_API_KEY', 'MAYNOR_API_KEY') else 'Missing'}"
     )
     st.write(f"FIREBASE_STORAGE_BUCKET: {'OK' if _env_ready('FIREBASE_STORAGE_BUCKET') else 'Missing'}")
     st.write(

@@ -161,6 +161,26 @@
 - 增加近似匹配策略（英文标准化 + 词形归一 + 阈值），并在 UI 展示候选对照与命中解释。
 - 为 entity map 增加并发写入保护（etag/generation）与版本回滚策略。
 
+## 2026-03-16（Verifier 分支：Maynor API Pro 接入与模型切换）
+
+日期时间：2026-03-16  
+分支：`feature/verifier`  
+完成项：
+- 新增 `MAYNOR_*` 兼容读取：`Settings` 与 `PipelineRunner` 现支持 `MAYNOR_API_KEY` / `MAYNOR_BASE_URL` / `MAYNOR_MODEL`，并保留 `SILICONFLOW_*`、`LLM_*` 兼容路径。
+- 增加基于域名的 API Key 选择策略：当 `BASE_URL` 指向 `apipro.maynor1024.live` 时优先使用 `MAYNOR_API_KEY`，避免混用旧 key 导致 401。
+- Streamlit 侧栏模型切换重构为：`Claude（模型1）`、`Gemini（模型2）`、`Maynor（自定义）`。
+- Streamlit 环境检查中的 API Key 可用性判断已纳入 `MAYNOR_API_KEY`。
+- 完成 Maynor 网关连通性排查，定位 `gpt-3.5-turbo` 在当前账号分组无可用通道导致 503。
+验证结果：
+- `smoke_llm.py` 在 Maynor + `gpt-4o-mini` 下可成功返回文本。
+- 模型探测结果：`claude-sonnet-4-6-thinking` 可用（200），`gemini-3.1-pro-preview` 当前分组返回 503（No available channels）。
+- 配置解析确认命中 `MAYNOR_BASE_URL=https://apipro.maynor1024.live/v1` 与当前选定模型。
+阻塞项：
+- `gemini-3.1-pro-preview` 在当前 `default` 分组暂无可用通道，需渠道侧开通或切组后再验证。
+下一步：
+- 使用 `Claude（模型1）` 在 UI 执行“到核验阶段”完成端到端验证。
+- 视渠道可用性决定是否加入“Gemini 自动回退 Claude”策略，减少联调中断。
+
 ## 记录模板
 
 ```
