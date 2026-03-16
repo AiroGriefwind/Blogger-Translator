@@ -367,15 +367,30 @@ class PipelineRunner:
 
     @staticmethod
     def _load_runtime_env(model_override: str = "") -> dict[str, str | int | float]:
-        api_key = os.getenv("SILICONFLOW_API_KEY", "").strip() or os.getenv(
-            "LLM_API_KEY", ""
-        ).strip()
-        base_url = os.getenv(
-            "SILICONFLOW_BASE_URL", ""
-        ).strip() or os.getenv("LLM_BASE_URL", "https://api.siliconflow.cn/v1").strip()
-        model = os.getenv("SILICONFLOW_MODEL", "").strip() or os.getenv(
-            "LLM_MODEL", "deepseek-r1"
-        ).strip()
+        base_url = (
+            os.getenv("SILICONFLOW_BASE_URL", "").strip()
+            or os.getenv("LLM_BASE_URL", "").strip()
+            or os.getenv("MAYNOR_BASE_URL", "").strip()
+            or "https://api.siliconflow.cn/v1"
+        )
+        if "maynor1024.live" in base_url:
+            api_key = (
+                os.getenv("MAYNOR_API_KEY", "").strip()
+                or os.getenv("SILICONFLOW_API_KEY", "").strip()
+                or os.getenv("LLM_API_KEY", "").strip()
+            )
+        else:
+            api_key = (
+                os.getenv("SILICONFLOW_API_KEY", "").strip()
+                or os.getenv("LLM_API_KEY", "").strip()
+                or os.getenv("MAYNOR_API_KEY", "").strip()
+            )
+        model = (
+            os.getenv("SILICONFLOW_MODEL", "").strip()
+            or os.getenv("LLM_MODEL", "").strip()
+            or os.getenv("MAYNOR_MODEL", "").strip()
+            or "deepseek-r1"
+        )
         if model_override.strip():
             model = model_override.strip()
         timeout_seconds = PipelineRunner._read_int_env(
@@ -402,7 +417,7 @@ class PipelineRunner:
     def _validate_llm_env(env: dict[str, str | int | float]) -> None:
         missing = []
         if not env["SILICONFLOW_API_KEY"]:
-            missing.append("SILICONFLOW_API_KEY")
+            missing.append("SILICONFLOW_API_KEY / LLM_API_KEY / MAYNOR_API_KEY")
         if missing:
             raise SettingsError(f"真实翻译模式缺少环境变量: {', '.join(missing)}")
 

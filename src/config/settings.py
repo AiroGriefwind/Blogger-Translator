@@ -29,15 +29,23 @@ class Settings:
 
     @classmethod
     def load(cls, require_storage: bool = True) -> "Settings":
-        siliconflow_api_key = os.getenv("SILICONFLOW_API_KEY", "") or os.getenv(
-            "LLM_API_KEY", ""
+        siliconflow_base_url = (
+            os.getenv("SILICONFLOW_BASE_URL", "")
+            or os.getenv("LLM_BASE_URL", "")
+            or os.getenv("MAYNOR_BASE_URL", "")
+            or "https://api.siliconflow.cn/v1"
         )
-        siliconflow_base_url = os.getenv(
-            "SILICONFLOW_BASE_URL", ""
-        ) or os.getenv("LLM_BASE_URL", "https://api.siliconflow.cn/v1")
+        if "maynor1024.live" in siliconflow_base_url:
+            siliconflow_api_key = os.getenv("MAYNOR_API_KEY", "") or os.getenv(
+                "SILICONFLOW_API_KEY", ""
+            ) or os.getenv("LLM_API_KEY", "")
+        else:
+            siliconflow_api_key = os.getenv("SILICONFLOW_API_KEY", "") or os.getenv(
+                "LLM_API_KEY", ""
+            ) or os.getenv("MAYNOR_API_KEY", "")
         siliconflow_model = os.getenv("SILICONFLOW_MODEL", "") or os.getenv(
-            "LLM_MODEL", "deepseek-r1"
-        )
+            "LLM_MODEL", ""
+        ) or os.getenv("MAYNOR_MODEL", "deepseek-r1")
         siliconflow_temperature = cls._read_float(
             "SILICONFLOW_TEMPERATURE",
             fallback_key="LLM_TEMPERATURE",
@@ -74,7 +82,7 @@ class Settings:
     def validate(self, require_storage: bool = True) -> None:
         missing = []
         if not self.siliconflow_api_key:
-            missing.append("SILICONFLOW_API_KEY (or LLM_API_KEY)")
+            missing.append("SILICONFLOW_API_KEY (or LLM_API_KEY / MAYNOR_API_KEY)")
         if require_storage:
             if not self.firebase_storage_bucket:
                 missing.append("FIREBASE_STORAGE_BUCKET")
