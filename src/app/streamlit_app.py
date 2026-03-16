@@ -5,6 +5,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+import re
 
 import streamlit as st
 
@@ -15,6 +16,11 @@ if str(SRC_ROOT) not in sys.path:
 
 from app.pipeline_runner import PipelineRunner, RunnerOptions
 from app.ui_state import STAGE_ORDER, init_ui_state, reset_pipeline_state, update_from_run_result
+from app.verifier_ui_utils import (
+    build_entity_groups,
+    build_entity_search_terms,
+    build_replacement_candidates,
+)
 from config.settings import SettingsError
 
 
@@ -274,6 +280,279 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("Verifier 结果")
     verifier_output = outputs.get("verifier", {})
+
+    def _append_runtime_log(message: str) -> None:
+        logs = st.session_state.get("pipeline_runtime_logs", [])
+        logs.append(
+            {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "stage": "verifier",
+                "message": message,
+            }
+        )
+        st.session_state["pipeline_runtime_logs"] = logs
+
+    def _update_outputs_state() -> None:
+        st.session_state["pipeline_stage_outputs"] = outputs
+
+    def _entity_brief(entity: dict) -> str:
+        zh = str(entity.get("entity_zh", "")).strip()
+        en = str(entity.get("entity_en", "")).strip()
+        if zh and en:
+            return f"{zh}/{en}"
+        return zh or en or "unknown"
+
+    def _replace_once_by_candidate(text: str, candidate: dict, replacement: str) -> tuple[str, bool]:
+        start = int(candidate.get("start", -1))
+        end = int(candidate.get("end", -1))
+        matched_text = str(candidate.get("matched_text", ""))
+        term = str(candidate.get("term", ""))
+        if 0 <= start < end <= len(text):
+            current = text[start:end]
+            if current.lower() == matched_text.lower():
+                return text[:start] + replacement + text[end:], True
+        if not term:
+            return text, False
+        pattern = re.compile(rf"(?<!\w){re.escape(term)}(?!\w)", flags=re.IGNORECASE)
+        new_text, replaced = pattern.subn(replacement, text, count=1)
+        return new_text, replaced > 0
+
+    def _apply_replacement(candidate: dict, replacement: str) -> bool:
+        scope = candidate.get("scope")
+        if scope == "translated_text":
+            translated = outputs.get("translated", {})
+            source = str(translated.get("translated_text", ""))
+            updated, changed = _replace_once_by_candidate(source, candidate, replacement)
+            if changed:
+                translated["translated_text"] = updated
+                outputs["translated"] = translated
+                _update_outputs_state()
+            return changed
+
+        if scope == "paragraph_en":
+            paragraph_id = candidate.get("paragraph_id")
+            paragraph_results = verifier_output.get("paragraph_results", [])
+            if not isinstance(paragraph_results, list):
+                return False
+            changed_any = False
+            for item in paragraph_results:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("paragraph_id") != paragraph_id:
+                    continue
+                source = str(item.get("en", ""))
+                updated, changed = _replace_once_by_candidate(source, candidate, replacement)
+                if changed:
+                    item["en"] = updated
+                    changed_any = True
+            if changed_any:
+                pairs = verifier_output.get("paragraph_pairs", [])
+                if isinstance(pairs, list):
+                    for pair in pairs:
+                        if not isinstance(pair, dict):
+                            continue
+                        if pair.get("paragraph_id") == paragraph_id:
+                            source = str(pair.get("en", ""))
+                            updated, changed = _replace_once_by_candidate(source, candidate, replacement)
+                            if changed:
+                                pair["en"] = updated
+                outputs["verifier"] = verifier_output
+                _update_outputs_state()
+            return changed_any
+        return False
+
+    def _mark_entity_saved(paragraph_id: int | str, entity_index: int, saved_payload: dict) -> None:
+        paragraph_results = verifier_output.get("paragraph_results", [])
+        if not isinstance(paragraph_results, list):
+            return
+        for paragraph in paragraph_results:
+            if not isinstance(paragraph, dict):
+                continue
+            if paragraph.get("paragraph_id") != paragraph_id:
+                continue
+            entities = paragraph.get("verified_entities", [])
+            if not isinstance(entities, list) or entity_index >= len(entities):
+                continue
+            entity = entities[entity_index]
+            if not isinstance(entity, dict):
+                continue
+            entity["manual_db_saved"] = True
+            entity["manual_db_saved_at"] = datetime.utcnow().isoformat()
+            entity["sources"] = saved_payload.get("sources", entity.get("sources", []))
+            entity["entity_zh"] = saved_payload.get("entity_zh", entity.get("entity_zh", ""))
+            entity["entity_en"] = saved_payload.get("entity_en", entity.get("entity_en", ""))
+            entity["type"] = saved_payload.get("type", entity.get("type", "other"))
+            entity["final_recommendation"] = saved_payload.get(
+                "final_recommendation", entity.get("final_recommendation", "")
+            )
+            break
+        outputs["verifier"] = verifier_output
+        _update_outputs_state()
+
+    @st.dialog("替换译文（逐条确认）")
+    def _replace_dialog() -> None:
+        target = st.session_state.get("verifier_replace_target")
+        if not isinstance(target, dict):
+            st.info("暂无替换目标。")
+            return
+        entity = target.get("entity", {})
+        if not isinstance(entity, dict):
+            st.info("替换目标数据异常。")
+            return
+
+        default_text = str(entity.get("entity_en", "")).strip()
+        replace_value = st.text_input(
+            "正确译文",
+            value=st.session_state.get("verifier_replace_text", default_text) or default_text,
+            key="verifier_replace_text",
+        ).strip()
+        if not replace_value:
+            st.warning("请先输入正确译文。")
+            return
+
+        translated = outputs.get("translated", {})
+        translated_text = str(translated.get("translated_text", ""))
+        paragraph_results = verifier_output.get("paragraph_results", [])
+        if not isinstance(paragraph_results, list):
+            paragraph_results = []
+        search_terms = build_entity_search_terms(
+            entity_en=str(entity.get("entity_en", "")),
+            entity_type=str(entity.get("type", "other")),
+        )
+        st.caption(f"检索词：{', '.join(search_terms) if search_terms else '(空)'}")
+        candidates = build_replacement_candidates(translated_text, paragraph_results, search_terms)
+        if not candidates:
+            st.info("没有找到可替换项。")
+        for idx, candidate in enumerate(candidates):
+            scope = candidate.get("scope_label", "")
+            context = str(candidate.get("context", ""))
+            matched = str(candidate.get("matched_text", ""))
+            st.markdown(f"**{idx + 1}. {scope}**")
+            st.caption(f"命中：`{matched}`")
+            st.code(context)
+            if st.button("确认替换", key=f"confirm_replace_{idx}_{candidate.get('scope', '')}"):
+                changed = _apply_replacement(candidate, replace_value)
+                if changed:
+                    _append_runtime_log(
+                        f"已替换命中词：{_entity_brief(entity)} -> {replace_value} ({scope})"
+                    )
+                    st.rerun()
+                st.warning("替换失败：命中位置已变化，请重新检查。")
+
+        if st.button("关闭替换窗口", key="close_replace_dialog"):
+            st.session_state["verifier_replace_target"] = None
+            st.session_state.pop("verifier_replace_text", None)
+            st.rerun()
+
+    @st.dialog("录入线上映射库")
+    def _insert_dialog() -> None:
+        target = st.session_state.get("verifier_insert_target")
+        form = st.session_state.get("verifier_insert_form")
+        if not isinstance(target, dict) or not isinstance(form, dict):
+            st.info("暂无录入目标。")
+            return
+
+        st.session_state["insert_entity_zh"] = st.session_state.get(
+            "insert_entity_zh", str(form.get("entity_zh", ""))
+        )
+        st.session_state["insert_entity_en"] = st.session_state.get(
+            "insert_entity_en", str(form.get("entity_en", ""))
+        )
+        st.session_state["insert_entity_type"] = st.session_state.get(
+            "insert_entity_type", str(form.get("type", "other"))
+        )
+        st.session_state["insert_entity_recommendation"] = st.session_state.get(
+            "insert_entity_recommendation", str(form.get("final_recommendation", ""))
+        )
+
+        st.text_input("原文实体（中文）", key="insert_entity_zh")
+        st.text_input("译文实体（英文）", key="insert_entity_en")
+        st.text_input("实体类型", key="insert_entity_type")
+        st.text_area("建议映射/备注", key="insert_entity_recommendation", height=90)
+
+        urls = form.get("sources", [])
+        if not isinstance(urls, list):
+            urls = []
+        form["sources"] = urls
+
+        st.markdown("**验证 URL（可增删）**")
+        for idx, source in enumerate(urls):
+            if not isinstance(source, dict):
+                source = {}
+                urls[idx] = source
+            col_url, col_note, col_del = st.columns([5, 3, 1])
+            url_key = f"insert_url_{idx}"
+            note_key = f"insert_note_{idx}"
+            if url_key not in st.session_state:
+                st.session_state[url_key] = str(source.get("url", ""))
+            if note_key not in st.session_state:
+                st.session_state[note_key] = str(source.get("evidence_note", ""))
+            with col_url:
+                st.text_input(f"URL {idx + 1}", key=url_key, label_visibility="collapsed")
+            with col_note:
+                st.text_input(f"证据说明 {idx + 1}", key=note_key, label_visibility="collapsed")
+            with col_del:
+                if st.button("-", key=f"remove_url_{idx}"):
+                    urls.pop(idx)
+                    st.session_state["verifier_insert_form"] = form
+                    st.rerun()
+
+        if st.button("+ 新增 URL", key="add_insert_url"):
+            urls.append({"url": "", "site": "", "evidence_note": ""})
+            st.session_state["verifier_insert_form"] = form
+            st.rerun()
+
+        if st.button("确认录入线上映射库", type="primary", key="confirm_insert_entity"):
+            payload_sources = []
+            for idx, _ in enumerate(urls):
+                url = str(st.session_state.get(f"insert_url_{idx}", "")).strip()
+                note = str(st.session_state.get(f"insert_note_{idx}", "")).strip()
+                if not url:
+                    continue
+                payload_sources.append({"url": url, "site": "", "evidence_note": note})
+
+            payload = {
+                "entity_zh": str(st.session_state.get("insert_entity_zh", "")).strip(),
+                "entity_en": str(st.session_state.get("insert_entity_en", "")).strip(),
+                "type": str(st.session_state.get("insert_entity_type", "other")).strip() or "other",
+                "is_verified": True,
+                "verification_status": "verified",
+                "sources": payload_sources,
+                "final_recommendation": str(
+                    st.session_state.get("insert_entity_recommendation", "")
+                ).strip(),
+            }
+            try:
+                write_stats = PipelineRunner().upsert_single_entity_to_online_db(
+                    run_id=run_id,
+                    entity=payload,
+                )
+                if int(write_stats.get("upserted", 0)) > 0:
+                    _mark_entity_saved(
+                        paragraph_id=target.get("paragraph_id", ""),
+                        entity_index=int(target.get("entity_index", -1)),
+                        saved_payload=payload,
+                    )
+                    _append_runtime_log(
+                        "手动录入线上映射库成功："
+                        f"{payload.get('entity_zh', '')}/{payload.get('entity_en', '')}"
+                    )
+                    st.success("已录入线上映射库。")
+                    st.session_state["verifier_insert_target"] = None
+                    st.session_state["verifier_insert_form"] = None
+                    st.rerun()
+                else:
+                    st.error("录入失败：至少需要一条有效 URL。")
+            except SettingsError as err:
+                st.error(str(err))
+            except Exception as err:  # pragma: no cover
+                st.exception(err)
+
+        if st.button("关闭录入窗口", key="close_insert_dialog"):
+            st.session_state["verifier_insert_target"] = None
+            st.session_state["verifier_insert_form"] = None
+            st.rerun()
+
     if verifier_output:
         write_to_db = st.button("确认写入线上映射库", key="write_entity_map_btn")
         if write_to_db:
@@ -289,21 +568,13 @@ with tabs[2]:
                     "entries": int(write_stats.get("entries", 0)),
                 }
                 outputs["verifier"] = verifier_output
-                st.session_state["pipeline_stage_outputs"] = outputs
-                logs = st.session_state.get("pipeline_runtime_logs", [])
-                logs.append(
-                    {
-                        "time": datetime.now().strftime("%H:%M:%S"),
-                        "stage": "verifier",
-                        "message": (
-                            "线上映射库写入完成："
-                            f"扫描 {write_stats.get('scanned', 0)}，"
-                            f"新增/更新 {write_stats.get('upserted', 0)}，"
-                            f"当前总条目 {write_stats.get('entries', 0)}"
-                        ),
-                    }
+                _update_outputs_state()
+                _append_runtime_log(
+                    "线上映射库写入完成："
+                    f"扫描 {write_stats.get('scanned', 0)}，"
+                    f"新增/更新 {write_stats.get('upserted', 0)}，"
+                    f"当前总条目 {write_stats.get('entries', 0)}"
                 )
-                st.session_state["pipeline_runtime_logs"] = logs
                 _render_runtime_progress()
                 st.success("已按确认写入线上映射库。")
             except SettingsError as err:
@@ -331,48 +602,111 @@ with tabs[2]:
                 st.json(notes)
 
         paragraph_results = verifier_output.get("paragraph_results", [])
-        if paragraph_results:
-            for item in paragraph_results:
-                paragraph_id = item.get("paragraph_id", "")
-                with st.expander(f"段落 {paragraph_id}"):
-                    st.caption("原文（中文）")
-                    st.write(item.get("zh", ""))
-                    st.caption("译文（英文）")
-                    st.write(item.get("en", ""))
+        if isinstance(paragraph_results, list) and paragraph_results:
+            grouped = build_entity_groups(paragraph_results)
 
-                    verified_entities = item.get("verified_entities", [])
-                    if not verified_entities:
-                        st.info("该段未识别到需要核验的实体。")
-                        continue
+            st.markdown("#### LLM 返回实体（可操作）")
+            llm_items = grouped.get("llm", [])
+            if not llm_items:
+                st.info("暂无需要人工处理的 LLM 返回实体。")
+            for row_idx, row in enumerate(llm_items):
+                entity = row.get("entity", {})
+                if not isinstance(entity, dict):
+                    continue
+                paragraph_id = row.get("paragraph_id", "")
+                entity_index = int(row.get("entity_index", -1))
+                with st.container(border=True):
+                    title = _entity_brief(entity)
+                    status = "已确认" if entity.get("is_verified", False) else "未确认"
+                    verification_status = str(entity.get("verification_status", "")).strip()
+                    st.markdown(
+                        f"**{title}** ({entity.get('type', 'other')}) - {status} | 来源：{verification_status or 'llm'}"
+                    )
+                    st.caption(f"段落 p{paragraph_id}")
+                    st.write(f"原文：{row.get('paragraph_zh', '')}")
+                    st.write(f"译文：{row.get('paragraph_en', '')}")
+                    if entity.get("final_recommendation"):
+                        st.write(f"建议：{entity.get('final_recommendation')}")
+                    if entity.get("uncertainty_reason"):
+                        st.warning(f"未确认原因：{entity.get('uncertainty_reason')}")
+                    queries = entity.get("next_search_queries", [])
+                    if isinstance(queries, list) and queries:
+                        st.caption(f"下一步检索建议：{', '.join(str(q) for q in queries)}")
+                    sources = entity.get("sources", [])
+                    if isinstance(sources, list) and sources:
+                        for src in sources:
+                            if not isinstance(src, dict):
+                                continue
+                            url = src.get("url", "")
+                            site = src.get("site", "")
+                            note = src.get("evidence_note", "")
+                            st.markdown(f"- [{site or url}]({url})")
+                            if note:
+                                st.caption(f"证据说明：{note}")
+                    else:
+                        st.caption("未返回可点击证据链接。")
 
-                    for entity in verified_entities:
-                        entity_zh = entity.get("entity_zh", "")
-                        entity_en = entity.get("entity_en", "")
-                        entity_type = entity.get("type", "other")
-                        status = "已确认" if entity.get("is_verified", False) else "未确认"
-                        verification_status = str(entity.get("verification_status", "")).strip()
-                        status_suffix = f" | 来源：{verification_status}" if verification_status else ""
+                    left_action, right_action = st.columns(2)
+                    if left_action.button("替换", key=f"entity_replace_{row_idx}_{paragraph_id}_{entity_index}"):
+                        st.session_state["verifier_replace_target"] = row
+                        st.session_state["verifier_replace_text"] = str(entity.get("entity_en", "")).strip()
+                        st.rerun()
+                    if right_action.button("录入", key=f"entity_insert_{row_idx}_{paragraph_id}_{entity_index}"):
+                        seed_sources = entity.get("sources", [])
+                        if not isinstance(seed_sources, list) or not seed_sources:
+                            seed_sources = [{"url": "", "site": "", "evidence_note": ""}]
+                        st.session_state["verifier_insert_target"] = row
+                        st.session_state["verifier_insert_form"] = {
+                            "entity_zh": str(entity.get("entity_zh", "")).strip(),
+                            "entity_en": str(entity.get("entity_en", "")).strip(),
+                            "type": str(entity.get("type", "other")).strip() or "other",
+                            "final_recommendation": str(entity.get("final_recommendation", "")).strip(),
+                            "sources": seed_sources,
+                        }
+                        st.rerun()
+                    if entity.get("manual_db_saved"):
+                        st.success("该实体已手动录入线上映射库。")
+
+            def _render_skip_group(group_key: str, title: str) -> None:
+                items = grouped.get(group_key, [])
+                if not items:
+                    return
+                labels = []
+                for item in items:
+                    ent = item.get("entity", {})
+                    if isinstance(ent, dict):
+                        labels.append(_entity_brief(ent))
+                summary = ", ".join(labels) if labels else "无"
+                with st.expander(f"{title}（{len(items)}）: {summary}"):
+                    for item in items:
+                        ent = item.get("entity", {})
+                        if not isinstance(ent, dict):
+                            continue
                         st.markdown(
-                            f"**{entity_zh} / {entity_en}** ({entity_type}) - {status}{status_suffix}"
+                            f"- **p{item.get('paragraph_id', '')}** {_entity_brief(ent)} "
+                            f"| status={ent.get('verification_status', '')}"
                         )
-                        if entity.get("final_recommendation"):
-                            st.write(f"建议：{entity.get('final_recommendation')}")
-                        if entity.get("uncertainty_reason"):
-                            st.warning(f"未确认原因：{entity.get('uncertainty_reason')}")
-                        queries = entity.get("next_search_queries", [])
-                        if queries:
-                            st.caption(f"下一步检索建议：{', '.join(str(q) for q in queries)}")
-                        sources = entity.get("sources", [])
-                        if sources:
+                        sources = ent.get("sources", [])
+                        if isinstance(sources, list) and sources:
                             for src in sources:
+                                if not isinstance(src, dict):
+                                    continue
                                 url = src.get("url", "")
                                 site = src.get("site", "")
                                 note = src.get("evidence_note", "")
-                                st.markdown(f"- [{site or url}]({url})")
+                                st.markdown(f"  - [{site or url}]({url})")
                                 if note:
-                                    st.caption(f"证据说明：{note}")
+                                    st.caption(f"    证据说明：{note}")
                         else:
-                            st.caption("未返回可点击证据链接。")
+                            st.caption("  - 无可点击 URL")
+
+            st.markdown("#### 跳过项")
+            _render_skip_group("db_exact_hit", "线上映射命中（db_exact_hit）")
+            _render_skip_group("runtime_cache_hit", "运行内缓存命中（runtime_cache_hit）")
+            if st.session_state.get("verifier_replace_target"):
+                _replace_dialog()
+            if st.session_state.get("verifier_insert_target"):
+                _insert_dialog()
         else:
             st.info("暂无逐段核验结果。")
     else:

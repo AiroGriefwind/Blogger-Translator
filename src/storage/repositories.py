@@ -132,6 +132,41 @@ class RunRepository:
         self.storage.upload_json(ENTITY_MAP_BLOB_PATH, data)
         return {"scanned": scanned, "upserted": upserted, "entries": len(entities)}
 
+    def upsert_single_verified_entity(self, run_id: str, entity: dict[str, Any]) -> dict[str, int]:
+        data = self.load_entity_map()
+        entities = data.setdefault("entities", {})
+        if not isinstance(entities, dict):
+            entities = {}
+            data["entities"] = entities
+
+        source_list = entity.get("sources", [])
+        if not isinstance(source_list, list):
+            source_list = []
+        valid_sources = [item for item in source_list if self._is_valid_source(item)]
+        if not valid_sources:
+            return {"upserted": 0, "entries": len(entities)}
+
+        key = build_entity_exact_key(
+            str(entity.get("entity_zh", "")),
+            str(entity.get("entity_en", "")),
+            str(entity.get("type", "other")),
+        )
+        entities[key] = {
+            "entity_zh": str(entity.get("entity_zh", "")).strip(),
+            "entity_en": str(entity.get("entity_en", "")).strip(),
+            "type": str(entity.get("type", "other")).strip() or "other",
+            "is_verified": bool(entity.get("is_verified", True)),
+            "verification_status": "verified",
+            "sources": valid_sources,
+            "final_recommendation": str(entity.get("final_recommendation", "")).strip(),
+            "updated_at": _utc_now(),
+            "last_run_id": run_id,
+        }
+        data["schema_version"] = "1.0"
+        data["updated_at"] = _utc_now()
+        self.storage.upload_json(ENTITY_MAP_BLOB_PATH, data)
+        return {"upserted": 1, "entries": len(entities)}
+
     def save_log(self, run_id: str, name: str, payload: dict) -> str:
         return self.storage.upload_json(f"runs/{run_id}/logs/{name}.json", payload)
 
