@@ -328,13 +328,16 @@ class PipelineRunner:
             emit("formatter", "mocked", "使用 mock 文本生成 docx")
             return output_file
         output_file = Path(output_dir) / f"{run_id}.docx"
+        revision_block = revised.get("revision", {})
+        if not isinstance(revision_block, dict):
+            revision_block = {}
         DocxFormatter().build(
             output_path=output_file,
-            title_en=f"{scraped.get('title', '')}",
+            title_en=str(revision_block.get("title_revised_en", "")).strip() or f"{scraped.get('title', '')}",
             author_en=scraped.get("author", ""),
-            body_blocks=[revised.get("revised_text", "")],
+            body_blocks=self._build_formatter_body_blocks(scraped, revised),
             ending_author_zh=scraped.get("author", ""),
-            captions_blocks=scraped.get("captions", []),
+            captions_blocks=self._build_formatter_captions(scraped, revised),
         )
         emit("formatter", "success", "docx 已生成")
         return output_file
@@ -487,6 +490,64 @@ class PipelineRunner:
                 status = "verified" if entity.get("is_verified", False) else "unverified"
                 questions.append(f"[p{pid}] {entity_zh} / {entity_en} -> {status}")
         return questions
+
+    @staticmethod
+    def _build_formatter_body_blocks(scraped: dict, revised: dict) -> list[str]:
+        revision_block = revised.get("revision", {})
+        if not isinstance(revision_block, dict):
+            revision_block = {}
+        revised_paragraphs = PipelineRunner._as_string_list(
+            revision_block.get("paragraphs_revised_en", [])
+        )
+        if not revised_paragraphs:
+            revised_paragraphs = PipelineRunner._as_string_list(
+                str(revised.get("revised_text", "")).split("\n\n")
+            )
+        source_paragraphs = PipelineRunner._as_string_list(scraped.get("body_paragraphs", []))
+        subtitle_map: dict[int, str] = {}
+        for item in revision_block.get("subtitles_en", []):
+            if not isinstance(item, dict):
+                continue
+            subtitle = str(item.get("subtitle", "")).strip()
+            if not subtitle:
+                continue
+            try:
+                insert_before = int(item.get("insert_before_paragraph", 0))
+            except (TypeError, ValueError):
+                continue
+            if insert_before > 0:
+                subtitle_map[insert_before] = subtitle
+
+        blocks: list[str] = []
+        for idx, revised_en in enumerate(revised_paragraphs, start=1):
+            if idx in subtitle_map:
+                blocks.append(subtitle_map[idx])
+            source_zh = source_paragraphs[idx - 1] if idx - 1 < len(source_paragraphs) else ""
+            pair_lines = [f"译文：{revised_en}"]
+            if source_zh:
+                pair_lines.append(f"原文：{source_zh}")
+            blocks.append("\n".join(pair_lines).strip())
+        if blocks:
+            return blocks
+        fallback = str(revised.get("revised_text", "")).strip()
+        return [fallback] if fallback else []
+
+    @staticmethod
+    def _build_formatter_captions(scraped: dict, revised: dict) -> list[str]:
+        revision_block = revised.get("revision", {})
+        if isinstance(revision_block, dict):
+            revised_captions = PipelineRunner._as_string_list(
+                revision_block.get("captions_revised_en", [])
+            )
+            if revised_captions:
+                return revised_captions
+        return PipelineRunner._as_string_list(scraped.get("captions", []))
+
+    @staticmethod
+    def _as_string_list(value) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
 
     def write_verified_entities_to_online_db(self, run_id: str, verifier_output: dict) -> dict[str, int]:
         env = self._load_runtime_env()

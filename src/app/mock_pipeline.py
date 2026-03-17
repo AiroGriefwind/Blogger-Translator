@@ -193,13 +193,33 @@ def build_mock_verifier_output() -> dict:
 def build_mock_docx(output_dir: str | Path, run_id: str, article: dict, revised: dict) -> Path:
     output_file = Path(output_dir) / f"{run_id}.docx"
     formatter = DocxFormatter()
+    revision_block = revised.get("revision", {})
+    if not isinstance(revision_block, dict):
+        revision_block = {}
+    revised_paragraphs = [
+        str(item).strip()
+        for item in revision_block.get("paragraphs_revised_en", [])
+        if str(item).strip()
+    ]
+    source_paragraphs = [str(item).strip() for item in article.get("body_paragraphs", []) if str(item).strip()]
+    body_blocks: list[str] = []
+    for idx, paragraph_en in enumerate(revised_paragraphs, start=1):
+        paragraph_zh = source_paragraphs[idx - 1] if idx - 1 < len(source_paragraphs) else ""
+        pair_lines = [f"译文：{paragraph_en}"]
+        if paragraph_zh:
+            pair_lines.append(f"原文：{paragraph_zh}")
+        body_blocks.append("\n".join(pair_lines).strip())
+    if not body_blocks:
+        fallback = str(revised.get("revised_text", "")).strip()
+        body_blocks = [fallback] if fallback else []
+
     formatter.build(
         output_path=output_file,
-        title_en=article.get("title", ""),
+        title_en=str(revision_block.get("title_revised_en", "")).strip() or article.get("title", ""),
         author_en=article.get("author", ""),
-        body_blocks=[revised.get("revised_text", "")],
+        body_blocks=body_blocks,
         ending_author_zh=article.get("author", ""),
-        captions_blocks=article.get("captions", []),
+        captions_blocks=revision_block.get("captions_revised_en", []) or article.get("captions", []),
     )
     return output_file
 
