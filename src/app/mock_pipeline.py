@@ -53,13 +53,42 @@ def build_mock_translated(article: dict) -> dict:
 
 
 def build_mock_revised(article: dict, translation: dict) -> dict:
+    paragraphs = [
+        "Energy prices whipsawed as conflicting policy signals hit the market.",
+        "Traders quickly repriced risk after fresh supply narratives emerged.",
+    ]
     return {
         "model": "mock-deepseek-r1",
-        "revised_text": (
-            "English Paragraph 1: Energy prices surged then retreated as signals conflicted.\n"
-            "中文段落 1：在互相矛盾的政策与供应信号下，能源价格先升后回。\n\n"
-            "English Paragraph 2: Traders repriced risk after fresh supply narratives.\n"
-            "中文段落 2：新的供给叙事出现后，交易员重新定价风险。"
+        "schema_version": "2.0",
+        "revision": {
+            "title_revised_en": article.get("title", ""),
+            "paragraphs_revised_en": paragraphs,
+            "captions_revised_en": article.get("captions", []),
+            "subtitles_en": [{"insert_before_paragraph": 1, "subtitle": "Market Shock And Repricing"}],
+        },
+        "revision_meta": {
+            "used_verifier": True,
+            "resolved_entities": 1,
+            "unresolved_entities": 1,
+            "total_parts": 1,
+            "degraded_reason": None,
+        },
+        "revision_outline": {
+            "schema_version": "1.0",
+            "total_paragraphs": 2,
+            "title_revised_en": article.get("title", ""),
+            "entity_mapping_used": True,
+            "parts": [
+                {
+                    "part_id": 1,
+                    "subtitle_en": "Market Shock And Repricing",
+                    "summary": "市场波动与风险重估。",
+                    "paragraph_ids": [1, 2],
+                }
+            ],
+        },
+        "revised_text": "\n\n".join(
+            ["Market Shock And Repricing", *paragraphs]
         ),
         "title_limit": 12,
         "caption_limit": 25,

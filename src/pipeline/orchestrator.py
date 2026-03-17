@@ -80,7 +80,11 @@ class PipelineOrchestrator:
 
             active_step = "revise"
             active_step_started_at = self._step_running(run_log, active_step)
-            revised = self.revisor.run(scraped, translated)
+            revised = self.revisor.run(scraped, translated, verifier_output)
+            revision_outline = revised.get("revision_outline")
+            if isinstance(revision_outline, dict) and revision_outline:
+                outline_uri = self.repo.save_log(run_id, "revision_outline", revision_outline)
+                run_log["artifacts"]["revision_outline_uri"] = outline_uri
             revised_uri = self.repo.save_revision(run_id, revised)
             run_log["artifacts"]["revised_uri"] = revised_uri
             self._step_success(run_log, active_step, active_step_started_at)
@@ -166,6 +170,7 @@ class PipelineOrchestrator:
                 "translated_uri": None,
                 "name_questions_uri": None,
                 "verifier_entities_uri": None,
+                "revision_outline_uri": None,
                 "revised_uri": None,
                 "docx_local_path": None,
                 "docx_cloud_path": None,

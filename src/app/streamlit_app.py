@@ -586,6 +586,19 @@ with tabs[2]:
         c1.metric("实体总数", int(summary.get("total_entities", 0)))
         c2.metric("已确认", int(summary.get("verified_entities", 0)))
         c3.metric("未确认", int(summary.get("unresolved_entities", 0)))
+        degrade_stats = summary.get("degrade_stats", {})
+        if isinstance(degrade_stats, dict):
+            a = int(degrade_stats.get("aligner_fallbacks", 0))
+            b = int(degrade_stats.get("extractor_failures", 0))
+            c = int(degrade_stats.get("verifier_failures", 0))
+            st.caption(
+                "降级统计："
+                f"aligner_fallbacks={a}, "
+                f"extractor_failures={b}, "
+                f"verifier_failures={c}"
+            )
+            if a > 0 or b > 0 or c > 0:
+                st.warning("本次核验触发了降级兜底，请查看日志与降级说明。")
         entity_db = verifier_output.get("entity_db", {})
         if isinstance(entity_db, dict) and entity_db:
             st.caption(
@@ -600,6 +613,11 @@ with tabs[2]:
         if notes:
             with st.expander("段落对齐说明"):
                 st.json(notes)
+        degradation_notes = verifier_output.get("degradation_notes", [])
+        if isinstance(degradation_notes, list) and degradation_notes:
+            with st.expander("核验降级说明"):
+                for note in degradation_notes:
+                    st.write(f"- {note}")
 
         paragraph_results = verifier_output.get("paragraph_results", [])
         if isinstance(paragraph_results, list) and paragraph_results:
