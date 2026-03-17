@@ -21,6 +21,10 @@ def init_ui_state() -> None:
     st.session_state.setdefault("pipeline_run_id", "")
     st.session_state.setdefault("pipeline_last_mode", "mock")
     st.session_state.setdefault("pipeline_verify_progress", {"done": 0, "total": 0, "percent": 0.0})
+    st.session_state.setdefault(
+        "pipeline_translator_progress",
+        {"total_chunks": 0, "current_chunk": 0, "total_retries": 0},
+    )
     st.session_state.setdefault("pipeline_runtime_logs", [])
 
 
@@ -31,6 +35,11 @@ def reset_pipeline_state() -> None:
     st.session_state["pipeline_artifacts"] = {}
     st.session_state["pipeline_run_id"] = ""
     st.session_state["pipeline_verify_progress"] = {"done": 0, "total": 0, "percent": 0.0}
+    st.session_state["pipeline_translator_progress"] = {
+        "total_chunks": 0,
+        "current_chunk": 0,
+        "total_retries": 0,
+    }
     st.session_state["pipeline_runtime_logs"] = []
 
 
@@ -46,6 +55,12 @@ def update_from_run_result(result: dict[str, Any]) -> None:
     runtime = result.get("runtime", {})
     st.session_state["pipeline_verify_progress"] = deepcopy(
         runtime.get("verify_progress", {"done": 0, "total": 0, "percent": 0.0})
+    )
+    st.session_state["pipeline_translator_progress"] = deepcopy(
+        runtime.get(
+            "translator_progress",
+            {"total_chunks": 0, "current_chunk": 0, "total_retries": 0},
+        )
     )
     st.session_state["pipeline_runtime_logs"] = deepcopy(runtime.get("logs", []))
 

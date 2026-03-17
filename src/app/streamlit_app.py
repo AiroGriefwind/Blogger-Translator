@@ -61,6 +61,71 @@ def _render_stage_board(stage_states: dict) -> None:
     st.markdown(_stage_board_markdown(stage_states))
 
 
+def _as_text_list(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _build_revisor_pairs(scraped: dict, revised: dict) -> tuple[list[dict], list[dict]]:
+    revision = revised.get("revision", {})
+    if not isinstance(revision, dict):
+        revision = {}
+
+    revised_paragraphs = _as_text_list(revision.get("paragraphs_revised_en", []))
+    if not revised_paragraphs:
+        revised_paragraphs = [block.strip() for block in str(revised.get("revised_text", "")).split("\n\n") if block.strip()]
+
+    source_paragraphs = _as_text_list(scraped.get("body_paragraphs", []))
+    pairs: list[dict] = []
+    for idx, revised_en in enumerate(revised_paragraphs, start=1):
+        source_zh = source_paragraphs[idx - 1] if idx - 1 < len(source_paragraphs) else ""
+        pairs.append({"paragraph_id": idx, "en": revised_en, "zh": source_zh})
+
+    outline = revised.get("revision_outline", {})
+    parts = outline.get("parts", []) if isinstance(outline, dict) else []
+    normalized_parts: list[dict] = []
+    used_ids: set[int] = set()
+    if isinstance(parts, list):
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            raw_ids = part.get("paragraph_ids", [])
+            if not isinstance(raw_ids, list):
+                continue
+            ids: list[int] = []
+            for raw in raw_ids:
+                try:
+                    pid = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= pid <= len(pairs):
+                    ids.append(pid)
+            if not ids:
+                continue
+            normalized_parts.append(
+                {
+                    "part_id": int(part.get("part_id", len(normalized_parts) + 1)),
+                    "subtitle_en": str(part.get("subtitle_en", "")).strip(),
+                    "paragraph_ids": ids,
+                }
+            )
+            used_ids.update(ids)
+
+    missing_ids = [idx for idx in range(1, len(pairs) + 1) if idx not in used_ids]
+    if missing_ids:
+        normalized_parts.append(
+            {
+                "part_id": len(normalized_parts) + 1,
+                "subtitle_en": "",
+                "paragraph_ids": missing_ids,
+            }
+        )
+    if not normalized_parts and pairs:
+        normalized_parts = [{"part_id": 1, "subtitle_en": "", "paragraph_ids": list(range(1, len(pairs) + 1))}]
+    return pairs, normalized_parts
+
+
 st.title("Blogger Translator")
 st.caption("完整 UI 编排版：支持真实/Mock 混合执行、分阶段可视化、错误追踪和产物下载。")
 
@@ -149,7 +214,19 @@ def _render_runtime_progress() -> None:
         else "核验进度：等待开始"
     )
     progress_placeholder.progress(min(max(percent / 100.0, 0.0), 1.0))
-    progress_text_placeholder.caption(text)
+    translator_progress = st.session_state.get(
+        "pipeline_translator_progress",
+        {"total_chunks": 0, "current_chunk": 0, "total_retries": 0},
+    )
+    t_total = int(translator_progress.get("total_chunks", 0))
+    t_current = int(translator_progress.get("current_chunk", 0))
+    t_retries = int(translator_progress.get("total_retries", 0))
+    t_text = (
+        f"翻译分块进度：{t_current}/{t_total}，累计重试 {t_retries} 次"
+        if t_total > 0
+        else "翻译分块进度：等待开始"
+    )
+    progress_text_placeholder.caption(f"{text} | {t_text}")
 
     runtime_logs = st.session_state.get("pipeline_runtime_logs", [])
     if runtime_logs:
@@ -176,6 +253,11 @@ if run_all or run_scraper_only or run_until_translator or run_until_verifier:
     live_states = st.session_state.get("pipeline_stage_states", {})
     st.session_state["pipeline_runtime_logs"] = []
     st.session_state["pipeline_verify_progress"] = {"done": 0, "total": 0, "percent": 0.0}
+    st.session_state["pipeline_translator_progress"] = {
+        "total_chunks": 0,
+        "current_chunk": 0,
+        "total_retries": 0,
+    }
     _render_runtime_progress()
 
     def on_stage_update(stage: str, status: str, detail: str) -> None:
@@ -212,6 +294,38 @@ if run_all or run_scraper_only or run_until_translator or run_until_verifier:
         st.session_state["pipeline_runtime_logs"] = logs
         _render_runtime_progress()
 
+    def on_translator_progress(payload: dict) -> None:
+        event = str(payload.get("event", "")).strip()
+        progress = st.session_state.get(
+            "pipeline_translator_progress",
+            {"total_chunks": 0, "current_chunk": 0, "total_retries": 0},
+        )
+        if event == "translator_start":
+            progress["total_chunks"] = int(payload.get("total_chunks", 0))
+            progress["current_chunk"] = 0
+            progress["total_retries"] = 0
+        elif event == "chunk_started":
+            progress["current_chunk"] = int(payload.get("chunk_id", 0))
+            progress["total_chunks"] = int(payload.get("total_chunks", progress.get("total_chunks", 0)))
+        elif event == "chunk_retry":
+            progress["total_retries"] = int(progress.get("total_retries", 0)) + 1
+        elif event == "translator_done":
+            progress["total_chunks"] = int(payload.get("total_chunks", progress.get("total_chunks", 0)))
+        st.session_state["pipeline_translator_progress"] = progress
+
+        message = str(payload.get("message", "")).strip()
+        if message:
+            logs = st.session_state.get("pipeline_runtime_logs", [])
+            logs.append(
+                {
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "stage": "translator",
+                    "message": message,
+                }
+            )
+            st.session_state["pipeline_runtime_logs"] = logs
+        _render_runtime_progress()
+
     try:
         with st.spinner("正在执行流水线，请稍候..."):
             result = runner.run_full(
@@ -220,6 +334,7 @@ if run_all or run_scraper_only or run_until_translator or run_until_verifier:
                 options=options,
                 on_stage_update=on_stage_update,
                 on_verifier_progress=on_verifier_progress,
+                on_translator_progress=on_translator_progress,
                 run_until_stage=(
                     "scraper"
                     if run_scraper_only
@@ -273,7 +388,73 @@ with tabs[1]:
     translated = outputs.get("translated", {})
     if translated:
         st.write(f"模型：{translated.get('model', '')}")
-        st.text_area("translated_text", translated.get("translated_text", ""), height=260)
+        scraped_for_translate = outputs.get("scraped", {})
+        chunk_metrics = translated.get("chunk_metrics", {})
+        if isinstance(chunk_metrics, dict) and chunk_metrics:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("分块数", int(chunk_metrics.get("total_chunks", 0)))
+            c2.metric("总尝试次数", int(chunk_metrics.get("total_attempts", 0)))
+            c3.metric("总重试次数", int(chunk_metrics.get("total_retries", 0)))
+            c4.metric("截断类重试", int(chunk_metrics.get("truncated_retries", 0)))
+        max_per_chunk = int(
+            (chunk_metrics or {}).get("chunk_max_paragraphs", 5)
+            if isinstance(chunk_metrics, dict)
+            else 5
+        )
+        source_paragraphs = []
+        if isinstance(scraped_for_translate, dict):
+            source_paragraphs = scraped_for_translate.get("body_paragraphs", [])
+        if isinstance(source_paragraphs, list) and source_paragraphs:
+            source_chunks = [
+                source_paragraphs[idx : idx + max_per_chunk]
+                for idx in range(0, len(source_paragraphs), max_per_chunk)
+            ]
+            with st.expander("查看翻译前原文分块", expanded=False):
+                for idx, blocks in enumerate(source_chunks, start=1):
+                    st.markdown(f"**Chunk {idx}/{len(source_chunks)}（{len(blocks)} 段）**")
+                    for pid, paragraph in enumerate(blocks, start=1):
+                        st.write(f"{pid}. {paragraph}")
+        chunk_events = translated.get("chunk_events", [])
+        if isinstance(chunk_events, list) and chunk_events:
+            with st.expander("查看翻译分块/重试明细"):
+                st.json(chunk_events)
+        translated_text_raw = str(translated.get("translated_text", ""))
+        translated_paragraphs: list[str] = []
+        translated_meta: dict = {}
+        try:
+            parsed = json.loads(translated_text_raw)
+            if isinstance(parsed, dict):
+                translation_block = parsed.get("translation", {})
+                if isinstance(translation_block, dict):
+                    translated_meta = {
+                        "title_en": str(translation_block.get("title_en", "")).strip(),
+                        "author_en": str(translation_block.get("author_en", "")).strip(),
+                        "published_at": str(translation_block.get("published_at", "")).strip(),
+                    }
+                    paragraph_list = translation_block.get("paragraphs_en", [])
+                    if isinstance(paragraph_list, list):
+                        translated_paragraphs = [
+                            str(item).strip() for item in paragraph_list if str(item).strip()
+                        ]
+        except json.JSONDecodeError:
+            translated_paragraphs = []
+
+        if not translated_paragraphs:
+            translated_paragraphs = [blk.strip() for blk in translated_text_raw.split("\n\n") if blk.strip()]
+
+        if translated_meta.get("title_en"):
+            st.write(f"标题(EN)：{translated_meta.get('title_en', '')}")
+        if translated_meta.get("author_en"):
+            st.write(f"作者(EN)：{translated_meta.get('author_en', '')}")
+        if translated_meta.get("published_at"):
+            st.write(f"发布时间：{translated_meta.get('published_at', '')}")
+
+        with st.expander("查看分段译文", expanded=True):
+            for idx, paragraph in enumerate(translated_paragraphs, start=1):
+                st.markdown(f"**P{idx}**")
+                st.write(paragraph)
+        with st.expander("查看原始 translated_text JSON", expanded=False):
+            st.text_area("translated_text_raw", translated_text_raw, height=260)
     else:
         st.info("暂无翻译结果。")
 
@@ -739,6 +920,7 @@ with tabs[2]:
 with tabs[3]:
     st.subheader("Revisor 结果")
     revised = outputs.get("revised", {})
+    scraped = outputs.get("scraped", {})
     if revised:
         st.write(f"模型：{revised.get('model', '')}")
         st.write(
@@ -748,7 +930,66 @@ with tabs[3]:
         note = revised.get("placeholder_note") or revised.get("mock_note")
         if note:
             st.caption(note)
-        st.text_area("revised_text", revised.get("revised_text", ""), height=300)
+
+        revision_block = revised.get("revision", {})
+        if not isinstance(revision_block, dict):
+            revision_block = {}
+        title_revised = str(revision_block.get("title_revised_en", "")).strip()
+        if title_revised:
+            st.markdown(f"**润色标题**：{title_revised}")
+
+        pairs, parts = _build_revisor_pairs(scraped if isinstance(scraped, dict) else {}, revised)
+        if pairs:
+            st.markdown("#### 分段对照（译文 / 原文）")
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                part_id = int(part.get("part_id", 0))
+                subtitle = str(part.get("subtitle_en", "")).strip()
+                title = f"Part {part_id}" if part_id > 0 else "Part"
+                if subtitle:
+                    st.markdown(f"##### {title}: {subtitle}")
+                else:
+                    st.markdown(f"##### {title}")
+                paragraph_ids = part.get("paragraph_ids", [])
+                if not isinstance(paragraph_ids, list):
+                    continue
+                for paragraph_id in paragraph_ids:
+                    try:
+                        pid = int(paragraph_id)
+                    except (TypeError, ValueError):
+                        continue
+                    if not (1 <= pid <= len(pairs)):
+                        continue
+                    row = pairs[pid - 1]
+                    with st.container(border=True):
+                        st.caption(f"段落 p{pid}")
+                        col_en, col_zh = st.columns(2)
+                        with col_en:
+                            st.markdown("**译文**")
+                            st.write(row.get("en", ""))
+                        with col_zh:
+                            st.markdown("**原文**")
+                            st.write(row.get("zh", "") or "（缺失原文段落）")
+        else:
+            st.info("暂无可分段展示的润色结果。")
+
+        with st.expander("查看 merged revised_text"):
+            st.text_area("revised_text", revised.get("revised_text", ""), height=220)
+
+        captions = _as_text_list(revision_block.get("captions_revised_en", []))
+        if captions:
+            with st.expander("查看润色 captions"):
+                for idx, cap in enumerate(captions, start=1):
+                    st.write(f"{idx}. {cap}")
+
+        with st.expander("查看 revision_meta / revision_outline"):
+            st.json(
+                {
+                    "revision_meta": revised.get("revision_meta", {}),
+                    "revision_outline": revised.get("revision_outline", {}),
+                }
+            )
     else:
         st.info("暂无润色结果。")
 
