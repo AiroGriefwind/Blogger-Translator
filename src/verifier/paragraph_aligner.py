@@ -38,7 +38,10 @@ class ParagraphAligner:
             user_prompt=json.dumps(payload, ensure_ascii=False, indent=2),
             temperature=self.temperature,
         )
-        parsed = _parse_json_object(content)
+        try:
+            parsed = _parse_json_object(content)
+        except Exception:
+            parsed = self._repair_and_parse_json(content)
         paragraph_pairs = parsed.get("paragraph_pairs", [])
         alignment_notes = parsed.get("alignment_notes", [])
         if not isinstance(paragraph_pairs, list):
@@ -51,16 +54,48 @@ class ParagraphAligner:
             "alignment_notes": alignment_notes,
         }
 
+    def _repair_and_parse_json(self, broken_content: str) -> dict[str, Any]:
+        repair_system_prompt = (
+            "You are a strict JSON repair tool. Return exactly one valid JSON object only."
+        )
+        repair_user_prompt = (
+            "Fix the following invalid JSON output. Keep original meaning and fields when possible.\n\n"
+            f"{broken_content}"
+        )
+        repaired = self.client.chat(
+            system_prompt=repair_system_prompt,
+            user_prompt=repair_user_prompt,
+            temperature=0.0,
+        )
+        return _parse_json_object(repaired)
+
 
 def _parse_json_object(content: str) -> dict[str, Any]:
     cleaned = content.strip()
     if cleaned.startswith("```"):
         cleaned = cleaned.strip("`").replace("json", "", 1).strip()
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start != -1 and end != -1 and end > start:
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
         cleaned = cleaned[start : end + 1]
-    data = json.loads(cleaned)
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            decoder = json.JSONDecoder()
+            for idx, char in enumerate(cleaned):
+                if char != "{":
+                    continue
+                try:
+                    data, _ = decoder.raw_decode(cleaned[idx:])
+                    break
+                except json.JSONDecodeError:
+                    continue
+            else:
+                raise
     if not isinstance(data, dict):
         raise ValueError("LLM 返回不是 JSON object")
     return data

@@ -107,7 +107,7 @@ class PipelineRunner:
             stage_outputs["name_questions"] = self._build_compat_name_questions(verifier_output)
             self._maybe_stop("verifier", should_stop_after, stage_states)
 
-            revised = self._run_revisor(scraped, translated, options, emit)
+            revised = self._run_revisor(scraped, translated, verifier_output, options, emit)
             stage_outputs["revised"] = revised
             self._maybe_stop("revisor", should_stop_after, stage_states)
 
@@ -284,7 +284,14 @@ class PipelineRunner:
         emit("verifier", "mocked", f"使用 mock 核验结果（{len(mock_questions)} 条）")
         return verifier_output
 
-    def _run_revisor(self, scraped: dict, translated: dict, options: RunnerOptions, emit: Callable) -> dict:
+    def _run_revisor(
+        self,
+        scraped: dict,
+        translated: dict,
+        verifier_output: dict,
+        options: RunnerOptions,
+        emit: Callable,
+    ) -> dict:
         emit("revisor", "running", "正在进行二轮润色...")
         self._maybe_fail("revisor", options.mock_fail_stage)
         if options.use_real_llm:
@@ -297,7 +304,7 @@ class PipelineRunner:
                 timeout=env["SILICONFLOW_TIMEOUT_SECONDS"],
                 max_retries=env["SILICONFLOW_MAX_RETRIES"],
             )
-            revised = RevisionStage(client).run(scraped, translated)
+            revised = RevisionStage(client).run(scraped, translated, verifier_output)
             revised["placeholder_note"] = "长度控制逻辑已预留，当前仍由下游后端完善。"
             emit("revisor", "success", "真实 LLM 润色完成")
             return revised
@@ -357,6 +364,9 @@ class PipelineRunner:
                 "name_questions",
                 {"questions": self._build_compat_name_questions(verifier_output)},
             )
+            revision_outline = revised.get("revision_outline")
+            if isinstance(revision_outline, dict) and revision_outline:
+                repo.save_log(run_id, "revision_outline", revision_outline)
             repo.save_revision(run_id, revised)
             cloud_path = repo.save_output_docx(run_id, str(output_file))
             emit("storage", "success", "已上传到 Firebase Storage")

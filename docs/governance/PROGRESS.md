@@ -202,6 +202,53 @@
 - 合并后在真实联网模型环境下跑“执行到核验阶段”，验证替换与录入交互在真实数据下的稳定性。
 - 评估是否引入近似匹配候选（非完全一致）以补充当前 `db_exact_hit` 命中策略。
 
+## 2026-03-17（Revisor：分段大纲驱动润色）
+
+日期时间：2026-03-17  
+分支：`feature/revisor`  
+完成项：
+- 新增 `Revision_Outline_Prompt.md` 与 `Revision_Chunk_Prompt.md`，将 revisor 拆为“大纲生成 + 分段润色”两类 prompt。
+- 重写 `RevisionStage`：支持 `run(scraped, translated, verifier_output=None)`，按 `<=5` 段切分流程执行“outline -> chunk revise -> assemble”。
+- 接入 translator JSON 契约解析（优先读取 `translation.paragraphs_en` / `captions.translated_captions`，失败时回退空行切段）。
+- 接入 verifier 输出摘要与实体映射，新增 `revision_meta`（`used_verifier`、`resolved_entities`、`unresolved_entities`、`total_parts`、`degraded_reason`）。
+- 在编排层打通 verifier -> revisor 传参：`pipeline_runner` 与 `orchestrator` 均改为传入 `verifier_output`。
+- 新增大纲落盘：通过 `save_log(run_id, "revision_outline", ...)` 写入 `runs/{run_id}/logs/revision_outline.json`。
+- 更新 mock 输出结构，补齐 `schema_version=2.0`、`revision`、`revision_meta`、`revision_outline` 字段。
+- 新增 `tests/test_revision_stage.py`，覆盖“有 verifier 输出”与“无 verifier 降级”路径。
+验证结果：
+- `python -m py_compile src/revisor/revision_stage.py src/app/pipeline_runner.py src/pipeline/orchestrator.py src/app/mock_pipeline.py tests/test_revision_stage.py` 通过。
+- `pytest -q tests/test_revision_stage.py tests/test_verifier_contract.py tests/test_verifier_ui_utils.py tests/test_repository_entity_map.py` 通过（11 passed）。
+阻塞项：
+- 当前分段边界由大纲模型输出决定；若模型输出不合法会回退固定 5 段切分，语义连贯性仍依赖后续提示词迭代。
+- chunk 级 caption 目前默认仅在首段任务改写，复杂多图文场景可进一步细化为按段绑定 caption。
+下一步：
+- 在真实 LLM + 真实 Storage 环境跑一次端到端，核对 `revision_outline`、`revised`、`docx` 三者一致性。
+- 由 `feature/formatter` 评估是否直接消费 `revision.paragraphs_revised_en` / `subtitles_en` 以提升结构化排版能力。
+
+## 2026-03-17（Verifier 稳定性：JSON 修复重试 + 降级可视化）
+
+日期时间：2026-03-17  
+分支：`feature/revisor`  
+完成项：
+- 为 `ParagraphAligner` / `EntityExtractor` / `EntityVerifier` 增加 JSON 解析修复重试：首次解析失败时，自动触发一次“JSON repair”补救请求并重解析。
+- 为上述三个组件增强 `_parse_json_object` 容错：在 code fence 清洗后，增加对象截取与 `raw_decode` 兜底提取，降低模型返回前后缀文本造成的解析失败。
+- 在 `VerifyStage` 增加流程级降级保护：`aligner` 失败回退按段号一一对齐；`extractor` 失败回退空实体列表；`entity_verifier` 失败回退 `unverified` 并补 `uncertainty_reason`。
+- 将降级事件打通到运行日志：新增 `align_failed` / `extract_failed` / `verify_failed` 事件，实时写入 UI 日志流。
+- 在 verifier 输出中新增 `summary.degrade_stats`（`aligner_fallbacks` / `extractor_failures` / `verifier_failures`）与 `degradation_notes`。
+- Streamlit verifier 页签新增“降级统计”与“核验降级说明”展示，确保降级行为在 UI 与 logs 中都可追踪。
+- 使用真实模型 `claude-sonnet-4-6-thinking` 完成端到端实测（含 storage 上传与 docx 产出），验证异常不再导致 verifier 阶段硬失败。
+验证结果：
+- `pytest -q tests/test_verifier_contract.py tests/test_verifier_ui_utils.py tests/test_revision_stage.py tests/test_repository_entity_map.py` 通过（11 passed）。
+- `read_lints` 检查通过（`verify_stage.py`、`streamlit_app.py` 等改动文件无新增 lint）。
+- 真实运行成功：`run_id=20260317041414_002904d2`，`verifier_summary` 返回 `total_entities=58 / verified=55 / unresolved=3`，并生成云端 docx。
+- 再次真实运行成功：`run_id=20260317044233_d8a9bec3`，`summary.degrade_stats` 字段存在且可读（本次为 0/0/0）。
+阻塞项：
+- JSON 修复重试会增加额外 LLM 调用成本；在模型波动高峰期可能拉长 verifier 阶段耗时。
+- 当前 translator 仍为“全文一次性翻译”，长文情况下依然可能产生超长输出和 JSON 不稳定风险。
+下一步：
+- 在 translator 分支评估“程序切段翻译 + 分块重试 + 最终拼装”方案，与 revisor 分段策略保持编号对齐。
+- 为 verifier 的降级计数增加长期监控指标（按 run_id 聚合），用于观察模型稳定性趋势与回归预警。
+
 ## 记录模板
 
 ```

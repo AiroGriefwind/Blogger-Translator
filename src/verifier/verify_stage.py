@@ -32,16 +32,23 @@ class VerifyStage:
         extractor = EntityExtractor(self.client, temperature=self.temperature)
         verifier = EntityVerifier(self.client, temperature=self.temperature)
 
-        aligned = aligner.run(
-            original_zh_paragraphs=zh_paragraphs,
-            translated_en_paragraphs=en_paragraphs,
-            metadata={
-                "title": scraped.get("title", ""),
-                "author": scraped.get("author", ""),
-                "published_at": scraped.get("published_at", ""),
-                "source_url": scraped.get("url", ""),
-            },
-        )
+        try:
+            aligned = aligner.run(
+                original_zh_paragraphs=zh_paragraphs,
+                translated_en_paragraphs=en_paragraphs,
+                metadata={
+                    "title": scraped.get("title", ""),
+                    "author": scraped.get("author", ""),
+                    "published_at": scraped.get("published_at", ""),
+                    "source_url": scraped.get("url", ""),
+                },
+            )
+        except Exception as err:
+            aligned = self._fallback_alignment(
+                zh_paragraphs=zh_paragraphs,
+                en_paragraphs=en_paragraphs,
+                err=err,
+            )
 
         aligned_pairs = [
             pair
@@ -64,16 +71,56 @@ class VerifyStage:
         total_entities = 0
         verified_entities = 0
         unresolved_entities = 0
+        aligner_fallbacks = 0
+        extractor_failures = 0
+        verifier_failures = 0
+        degradation_notes: list[str] = []
         done_paragraphs = 0
         run_cache: dict[str, dict[str, Any]] = {}
+        alignment_notes = aligned.get("alignment_notes", [])
+        if isinstance(alignment_notes, list):
+            for note in alignment_notes:
+                if isinstance(note, dict) and str(note.get("type", "")).strip() == "fallback":
+                    aligner_fallbacks += 1
+                    degradation_notes.append(str(note.get("message", "")).strip())
+                    if on_progress:
+                        on_progress(
+                            {
+                                "event": "align_failed",
+                                "done_paragraphs": 0,
+                                "total_paragraphs": total_paragraphs,
+                                "percent": 0.0,
+                                "message": f"段落对齐失败，已降级按段号一一对齐：{note.get('message', '')}",
+                            }
+                        )
 
         for pair in aligned_pairs:
             paragraph_id = int(pair.get("paragraph_id", 0))
             zh = str(pair.get("zh", ""))
             en = str(pair.get("en", ""))
 
-            extracted = extractor.run(paragraph_id=paragraph_id, zh=zh, en=en)
-            extracted_entities = extracted.get("entities", [])
+            try:
+                extracted = extractor.run(paragraph_id=paragraph_id, zh=zh, en=en)
+                extracted_entities = extracted.get("entities", [])
+            except Exception as err:
+                extracted_entities = []
+                extractor_failures += 1
+                degradation_notes.append(f"extract_failed:p{paragraph_id}:{err}")
+                if on_progress:
+                    on_progress(
+                        {
+                            "event": "extract_failed",
+                            "done_paragraphs": done_paragraphs,
+                            "total_paragraphs": total_paragraphs,
+                            "paragraph_id": paragraph_id,
+                            "percent": (
+                                done_paragraphs / total_paragraphs * 100.0 if total_paragraphs else 100.0
+                            ),
+                            "message": (
+                                f"段落ID={paragraph_id} 实体抽取失败，已降级为空实体列表：{err}"
+                            ),
+                        }
+                    )
             verified_items: list[dict[str, Any]] = []
 
             for entity in extracted_entities:
@@ -131,12 +178,35 @@ class VerifyStage:
                                     }
                                 )
                     if not verified:
-                        verified = verifier.run(
-                            paragraph_id=paragraph_id,
-                            paragraph_zh=zh,
-                            paragraph_en=en,
-                            entity=entity,
-                        ).get("entity", {})
+                        try:
+                            verified = verifier.run(
+                                paragraph_id=paragraph_id,
+                                paragraph_zh=zh,
+                                paragraph_en=en,
+                                entity=entity,
+                            ).get("entity", {})
+                        except Exception as err:
+                            verifier_failures += 1
+                            degradation_notes.append(f"verify_failed:p{paragraph_id}:{err}")
+                            verified = self._fallback_unverified_entity(entity, err)
+                            if on_progress:
+                                on_progress(
+                                    {
+                                        "event": "verify_failed",
+                                        "done_paragraphs": done_paragraphs,
+                                        "total_paragraphs": total_paragraphs,
+                                        "paragraph_id": paragraph_id,
+                                        "percent": (
+                                            done_paragraphs / total_paragraphs * 100.0
+                                            if total_paragraphs
+                                            else 100.0
+                                        ),
+                                        "message": (
+                                            "实体核验 JSON 解析失败，已降级 unverified："
+                                            f"{verified.get('entity_zh', '')} / {verified.get('entity_en', '')}"
+                                        ),
+                                    }
+                                )
                     if isinstance(verified, dict) and verified:
                         run_cache[exact_key] = deepcopy(verified)
 
@@ -192,8 +262,14 @@ class VerifyStage:
                 "total_entities": total_entities,
                 "verified_entities": verified_entities,
                 "unresolved_entities": unresolved_entities,
+                "degrade_stats": {
+                    "aligner_fallbacks": aligner_fallbacks,
+                    "extractor_failures": extractor_failures,
+                    "verifier_failures": verifier_failures,
+                },
             },
-            "alignment_notes": aligned.get("alignment_notes", []),
+            "alignment_notes": alignment_notes,
+            "degradation_notes": degradation_notes,
             "paragraph_pairs": aligned.get("paragraph_pairs", []),
             "paragraph_results": paragraph_results,
         }
@@ -223,3 +299,44 @@ class VerifyStage:
         # 联调兜底：若未返回 JSON，按空行切段。
         paragraphs = [chunk.strip() for chunk in raw.split("\n\n") if chunk.strip()]
         return paragraphs
+
+    @staticmethod
+    def _fallback_alignment(
+        zh_paragraphs: list[str],
+        en_paragraphs: list[str],
+        err: Exception,
+    ) -> dict[str, Any]:
+        total = max(len(zh_paragraphs), len(en_paragraphs))
+        pairs = []
+        for idx in range(total):
+            pairs.append(
+                {
+                    "paragraph_id": idx + 1,
+                    "zh": zh_paragraphs[idx] if idx < len(zh_paragraphs) else "",
+                    "en": en_paragraphs[idx] if idx < len(en_paragraphs) else "",
+                }
+            )
+        return {
+            "schema_version": "1.0",
+            "paragraph_pairs": pairs,
+            "alignment_notes": [
+                {
+                    "type": "fallback",
+                    "message": f"aligner_failed_degraded: {err}",
+                }
+            ],
+        }
+
+    @staticmethod
+    def _fallback_unverified_entity(entity: dict[str, Any], err: Exception) -> dict[str, Any]:
+        return {
+            "entity_zh": str(entity.get("entity_zh", "")).strip(),
+            "entity_en": str(entity.get("entity_en", "")).strip(),
+            "type": str(entity.get("type", "other")).strip() or "other",
+            "is_verified": False,
+            "verification_status": "unverified",
+            "sources": [],
+            "final_recommendation": str(entity.get("final_recommendation", "")).strip(),
+            "uncertainty_reason": f"verify_stage_degraded_due_to_json_error: {err}",
+            "next_search_queries": [],
+        }
