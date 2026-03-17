@@ -48,6 +48,7 @@ class PipelineRunner:
         options: RunnerOptions,
         on_stage_update: Callable[[str, str, str], None] | None = None,
         on_verifier_progress: Callable[[dict], None] | None = None,
+        on_translator_progress: Callable[[dict], None] | None = None,
         run_until_stage: str | None = None,
     ) -> dict:
         if not url.strip():
@@ -60,6 +61,11 @@ class PipelineRunner:
         error: dict | None = None
         runtime = {
             "verify_progress": {"done": 0, "total": 0, "percent": 0.0},
+            "translator_progress": {
+                "total_chunks": 0,
+                "current_chunk": 0,
+                "total_retries": 0,
+            },
             "logs": [],
         }
         should_stop_after = run_until_stage if run_until_stage in STAGE_ORDER else None
@@ -87,12 +93,44 @@ class PipelineRunner:
             if on_verifier_progress:
                 on_verifier_progress(payload)
 
+        def emit_translator_progress(payload: dict) -> None:
+            event = str(payload.get("event", "")).strip()
+            if event == "translator_start":
+                runtime["translator_progress"]["total_chunks"] = int(payload.get("total_chunks", 0))
+                runtime["translator_progress"]["current_chunk"] = 0
+                runtime["translator_progress"]["total_retries"] = 0
+            elif event == "chunk_started":
+                runtime["translator_progress"]["current_chunk"] = int(payload.get("chunk_id", 0))
+            elif event == "chunk_retry":
+                runtime["translator_progress"]["total_retries"] = int(
+                    runtime["translator_progress"].get("total_retries", 0)
+                ) + 1
+            elif event == "translator_done":
+                runtime["translator_progress"]["total_chunks"] = int(payload.get("total_chunks", 0))
+
+            message = str(payload.get("message", "")).strip()
+            if message:
+                runtime["logs"].append(
+                    {
+                        "time": strftime("%H:%M:%S"),
+                        "stage": "translator",
+                        "message": message,
+                    }
+                )
+            if on_translator_progress:
+                on_translator_progress(payload)
+
         try:
             scraped = self._run_scraper(url, options, emit)
             stage_outputs["scraped"] = scraped
             self._maybe_stop("scraper", should_stop_after, stage_states)
 
-            translated = self._run_translator(scraped, options, emit)
+            translated = self._run_translator(
+                scraped,
+                options,
+                emit,
+                on_translator_progress=emit_translator_progress,
+            )
             stage_outputs["translated"] = translated
             self._maybe_stop("translator", should_stop_after, stage_states)
 
@@ -183,7 +221,13 @@ class PipelineRunner:
         emit("scraper", "mocked", "使用 mock 抓取数据")
         return scraped
 
-    def _run_translator(self, scraped: dict, options: RunnerOptions, emit: Callable) -> dict:
+    def _run_translator(
+        self,
+        scraped: dict,
+        options: RunnerOptions,
+        emit: Callable,
+        on_translator_progress: Callable[[dict], None] | None = None,
+    ) -> dict:
         emit("translator", "running", "正在进行首轮翻译...")
         self._maybe_fail("translator", options.mock_fail_stage)
         if options.use_real_llm:
@@ -196,12 +240,26 @@ class PipelineRunner:
                 timeout=env["SILICONFLOW_TIMEOUT_SECONDS"],
                 max_retries=env["SILICONFLOW_MAX_RETRIES"],
             )
-            translated = TranslateStage(client, temperature=env["SILICONFLOW_TEMPERATURE"]).run(
-                scraped
-            )
+            translated = TranslateStage(
+                client,
+                temperature=env["SILICONFLOW_TEMPERATURE"],
+                chunk_enabled=bool(env["TRANSLATOR_CHUNK_ENABLED"]),
+                chunk_max_paragraphs=int(env["TRANSLATOR_CHUNK_MAX_PARAGRAPHS"]),
+            ).run(scraped, on_progress=on_translator_progress)
             emit("translator", "success", "真实 LLM 翻译完成")
             return translated
         translated = build_mock_translated(scraped)
+        if on_translator_progress:
+            on_translator_progress(
+                {
+                    "event": "translator_done",
+                    "mode": "mock",
+                    "total_chunks": 1,
+                    "total_attempts": 1,
+                    "total_retries": 0,
+                    "message": "翻译完成：mock 模式。",
+                }
+            )
         emit("translator", "mocked", "使用 mock 翻译结果")
         return translated
 
@@ -358,6 +416,12 @@ class PipelineRunner:
             repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
             repo.save_raw_article(run_id, scraped)
             repo.save_translation(run_id, translated)
+            chunk_metrics = translated.get("chunk_metrics", {})
+            chunk_events = translated.get("chunk_events", [])
+            if isinstance(chunk_metrics, dict) and chunk_metrics:
+                repo.save_log(run_id, "translator_chunk_metrics", chunk_metrics)
+            if isinstance(chunk_events, list) and chunk_events:
+                repo.save_log(run_id, "translator_chunk_events", {"events": chunk_events})
             repo.save_log(run_id, "verifier_entities", verifier_output)
             repo.save_log(
                 run_id,
@@ -376,7 +440,7 @@ class PipelineRunner:
         return cloud_path
 
     @staticmethod
-    def _load_runtime_env(model_override: str = "") -> dict[str, str | int | float]:
+    def _load_runtime_env(model_override: str = "") -> dict[str, str | int | float | bool]:
         base_url = (
             os.getenv("SILICONFLOW_BASE_URL", "").strip()
             or os.getenv("LLM_BASE_URL", "").strip()
@@ -412,6 +476,12 @@ class PipelineRunner:
         temperature = PipelineRunner._read_float_env(
             "SILICONFLOW_TEMPERATURE", "LLM_TEMPERATURE", 0.2
         )
+        translator_chunk_enabled = PipelineRunner._read_bool_env(
+            "TRANSLATOR_CHUNK_ENABLED", True
+        )
+        translator_chunk_max_paragraphs = PipelineRunner._read_int_env(
+            "TRANSLATOR_CHUNK_MAX_PARAGRAPHS", "", 5
+        )
         return {
             "SILICONFLOW_API_KEY": api_key,
             "SILICONFLOW_BASE_URL": base_url,
@@ -419,6 +489,8 @@ class PipelineRunner:
             "SILICONFLOW_TEMPERATURE": temperature,
             "SILICONFLOW_TIMEOUT_SECONDS": timeout_seconds,
             "SILICONFLOW_MAX_RETRIES": max_retries,
+            "TRANSLATOR_CHUNK_ENABLED": translator_chunk_enabled,
+            "TRANSLATOR_CHUNK_MAX_PARAGRAPHS": translator_chunk_max_paragraphs,
             "FIREBASE_STORAGE_BUCKET": os.getenv("FIREBASE_STORAGE_BUCKET", "").strip(),
             "GOOGLE_APPLICATION_CREDENTIALS": os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip(),
         }
@@ -433,7 +505,9 @@ class PipelineRunner:
 
     @staticmethod
     def _read_int_env(primary_key: str, fallback_key: str, default: int) -> int:
-        raw = os.getenv(primary_key, "").strip() or os.getenv(fallback_key, "").strip()
+        raw = os.getenv(primary_key, "").strip()
+        if not raw and fallback_key:
+            raw = os.getenv(fallback_key, "").strip()
         if not raw:
             return default
         try:
@@ -450,6 +524,17 @@ class PipelineRunner:
             return float(raw)
         except ValueError as exc:
             raise SettingsError(f"{primary_key}/{fallback_key} 必须是数字") from exc
+
+    @staticmethod
+    def _read_bool_env(primary_key: str, default: bool) -> bool:
+        raw = os.getenv(primary_key, "").strip().lower()
+        if not raw:
+            return default
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        raise SettingsError(f"{primary_key} 必须是布尔值(true/false)")
 
     @staticmethod
     def _validate_storage_env(env: dict[str, str]) -> None:

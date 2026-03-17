@@ -24,6 +24,8 @@ class Settings:
     siliconflow_temperature: float
     siliconflow_timeout_seconds: int
     siliconflow_max_retries: int
+    translator_chunk_enabled: bool
+    translator_chunk_max_paragraphs: int
     firebase_storage_bucket: str
     google_application_credentials: str
 
@@ -63,6 +65,16 @@ class Settings:
             default=2,
             min_value=0,
         )
+        translator_chunk_enabled = cls._read_bool(
+            "TRANSLATOR_CHUNK_ENABLED",
+            default=True,
+        )
+        translator_chunk_max_paragraphs = cls._read_int(
+            "TRANSLATOR_CHUNK_MAX_PARAGRAPHS",
+            fallback_key="",
+            default=5,
+            min_value=1,
+        )
         payload = cls(
             app_env=os.getenv("APP_ENV", "dev"),
             siliconflow_api_key=siliconflow_api_key,
@@ -71,6 +83,8 @@ class Settings:
             siliconflow_temperature=siliconflow_temperature,
             siliconflow_timeout_seconds=siliconflow_timeout_seconds,
             siliconflow_max_retries=siliconflow_max_retries,
+            translator_chunk_enabled=translator_chunk_enabled,
+            translator_chunk_max_paragraphs=translator_chunk_max_paragraphs,
             firebase_storage_bucket=os.getenv("FIREBASE_STORAGE_BUCKET", ""),
             google_application_credentials=os.getenv(
                 "GOOGLE_APPLICATION_CREDENTIALS", ""
@@ -99,7 +113,9 @@ class Settings:
         default: int,
         min_value: int | None = None,
     ) -> int:
-        raw = os.getenv(primary_key, "") or os.getenv(fallback_key, "")
+        raw = os.getenv(primary_key, "")
+        if not raw and fallback_key:
+            raw = os.getenv(fallback_key, "")
         if not raw:
             return default
         try:
@@ -121,4 +137,15 @@ class Settings:
             return float(raw)
         except ValueError as exc:
             raise SettingsError(f"{primary_key}/{fallback_key} 必须是数字") from exc
+
+    @staticmethod
+    def _read_bool(primary_key: str, default: bool) -> bool:
+        raw = os.getenv(primary_key, "").strip().lower()
+        if not raw:
+            return default
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        raise SettingsError(f"{primary_key} 必须是布尔值(true/false)")
 

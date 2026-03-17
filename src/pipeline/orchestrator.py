@@ -30,7 +30,10 @@ class PipelineOrchestrator:
             max_retries=self.settings.siliconflow_max_retries,
         )
         self.translator = TranslateStage(
-            self.client, temperature=self.settings.siliconflow_temperature
+            self.client,
+            temperature=self.settings.siliconflow_temperature,
+            chunk_enabled=self.settings.translator_chunk_enabled,
+            chunk_max_paragraphs=self.settings.translator_chunk_max_paragraphs,
         )
         self.revisor = RevisionStage(self.client)
         self.verifier = VerifyStage(self.client, temperature=self.settings.siliconflow_temperature)
@@ -63,6 +66,18 @@ class PipelineOrchestrator:
             translated = self.translator.run(scraped)
             translated_uri = self.repo.save_translation(run_id, translated)
             run_log["artifacts"]["translated_uri"] = translated_uri
+            chunk_metrics = translated.get("chunk_metrics", {})
+            chunk_events = translated.get("chunk_events", [])
+            if isinstance(chunk_metrics, dict) and chunk_metrics:
+                translator_metrics_uri = self.repo.save_log(
+                    run_id, "translator_chunk_metrics", chunk_metrics
+                )
+                run_log["artifacts"]["translator_chunk_metrics_uri"] = translator_metrics_uri
+            if isinstance(chunk_events, list) and chunk_events:
+                translator_events_uri = self.repo.save_log(
+                    run_id, "translator_chunk_events", {"events": chunk_events}
+                )
+                run_log["artifacts"]["translator_chunk_events_uri"] = translator_events_uri
             self._step_success(run_log, active_step, active_step_started_at)
             active_step = None
 
