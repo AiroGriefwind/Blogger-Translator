@@ -61,6 +61,71 @@ def _render_stage_board(stage_states: dict) -> None:
     st.markdown(_stage_board_markdown(stage_states))
 
 
+def _as_text_list(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _build_revisor_pairs(scraped: dict, revised: dict) -> tuple[list[dict], list[dict]]:
+    revision = revised.get("revision", {})
+    if not isinstance(revision, dict):
+        revision = {}
+
+    revised_paragraphs = _as_text_list(revision.get("paragraphs_revised_en", []))
+    if not revised_paragraphs:
+        revised_paragraphs = [block.strip() for block in str(revised.get("revised_text", "")).split("\n\n") if block.strip()]
+
+    source_paragraphs = _as_text_list(scraped.get("body_paragraphs", []))
+    pairs: list[dict] = []
+    for idx, revised_en in enumerate(revised_paragraphs, start=1):
+        source_zh = source_paragraphs[idx - 1] if idx - 1 < len(source_paragraphs) else ""
+        pairs.append({"paragraph_id": idx, "en": revised_en, "zh": source_zh})
+
+    outline = revised.get("revision_outline", {})
+    parts = outline.get("parts", []) if isinstance(outline, dict) else []
+    normalized_parts: list[dict] = []
+    used_ids: set[int] = set()
+    if isinstance(parts, list):
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            raw_ids = part.get("paragraph_ids", [])
+            if not isinstance(raw_ids, list):
+                continue
+            ids: list[int] = []
+            for raw in raw_ids:
+                try:
+                    pid = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= pid <= len(pairs):
+                    ids.append(pid)
+            if not ids:
+                continue
+            normalized_parts.append(
+                {
+                    "part_id": int(part.get("part_id", len(normalized_parts) + 1)),
+                    "subtitle_en": str(part.get("subtitle_en", "")).strip(),
+                    "paragraph_ids": ids,
+                }
+            )
+            used_ids.update(ids)
+
+    missing_ids = [idx for idx in range(1, len(pairs) + 1) if idx not in used_ids]
+    if missing_ids:
+        normalized_parts.append(
+            {
+                "part_id": len(normalized_parts) + 1,
+                "subtitle_en": "",
+                "paragraph_ids": missing_ids,
+            }
+        )
+    if not normalized_parts and pairs:
+        normalized_parts = [{"part_id": 1, "subtitle_en": "", "paragraph_ids": list(range(1, len(pairs) + 1))}]
+    return pairs, normalized_parts
+
+
 st.title("Blogger Translator")
 st.caption("完整 UI 编排版：支持真实/Mock 混合执行、分阶段可视化、错误追踪和产物下载。")
 
@@ -855,6 +920,7 @@ with tabs[2]:
 with tabs[3]:
     st.subheader("Revisor 结果")
     revised = outputs.get("revised", {})
+    scraped = outputs.get("scraped", {})
     if revised:
         st.write(f"模型：{revised.get('model', '')}")
         st.write(
@@ -864,7 +930,66 @@ with tabs[3]:
         note = revised.get("placeholder_note") or revised.get("mock_note")
         if note:
             st.caption(note)
-        st.text_area("revised_text", revised.get("revised_text", ""), height=300)
+
+        revision_block = revised.get("revision", {})
+        if not isinstance(revision_block, dict):
+            revision_block = {}
+        title_revised = str(revision_block.get("title_revised_en", "")).strip()
+        if title_revised:
+            st.markdown(f"**润色标题**：{title_revised}")
+
+        pairs, parts = _build_revisor_pairs(scraped if isinstance(scraped, dict) else {}, revised)
+        if pairs:
+            st.markdown("#### 分段对照（译文 / 原文）")
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                part_id = int(part.get("part_id", 0))
+                subtitle = str(part.get("subtitle_en", "")).strip()
+                title = f"Part {part_id}" if part_id > 0 else "Part"
+                if subtitle:
+                    st.markdown(f"##### {title}: {subtitle}")
+                else:
+                    st.markdown(f"##### {title}")
+                paragraph_ids = part.get("paragraph_ids", [])
+                if not isinstance(paragraph_ids, list):
+                    continue
+                for paragraph_id in paragraph_ids:
+                    try:
+                        pid = int(paragraph_id)
+                    except (TypeError, ValueError):
+                        continue
+                    if not (1 <= pid <= len(pairs)):
+                        continue
+                    row = pairs[pid - 1]
+                    with st.container(border=True):
+                        st.caption(f"段落 p{pid}")
+                        col_en, col_zh = st.columns(2)
+                        with col_en:
+                            st.markdown("**译文**")
+                            st.write(row.get("en", ""))
+                        with col_zh:
+                            st.markdown("**原文**")
+                            st.write(row.get("zh", "") or "（缺失原文段落）")
+        else:
+            st.info("暂无可分段展示的润色结果。")
+
+        with st.expander("查看 merged revised_text"):
+            st.text_area("revised_text", revised.get("revised_text", ""), height=220)
+
+        captions = _as_text_list(revision_block.get("captions_revised_en", []))
+        if captions:
+            with st.expander("查看润色 captions"):
+                for idx, cap in enumerate(captions, start=1):
+                    st.write(f"{idx}. {cap}")
+
+        with st.expander("查看 revision_meta / revision_outline"):
+            st.json(
+                {
+                    "revision_meta": revised.get("revision_meta", {}),
+                    "revision_outline": revised.get("revision_outline", {}),
+                }
+            )
     else:
         st.info("暂无润色结果。")
 
