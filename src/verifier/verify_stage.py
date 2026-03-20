@@ -111,7 +111,8 @@ class VerifyStage:
                         db_match = lookup_exact(entity)
                         if isinstance(db_match, dict):
                             verified = deepcopy(db_match)
-                            verified["verification_status"] = "db_exact_hit"
+                            if not str(verified.get("verification_status", "")).strip():
+                                verified["verification_status"] = "db_exact_hit"
                             if on_progress:
                                 on_progress(
                                     {
