@@ -53,13 +53,42 @@ def build_mock_translated(article: dict) -> dict:
 
 
 def build_mock_revised(article: dict, translation: dict) -> dict:
+    paragraphs = [
+        "Energy prices whipsawed as conflicting policy signals hit the market.",
+        "Traders quickly repriced risk after fresh supply narratives emerged.",
+    ]
     return {
         "model": "mock-deepseek-r1",
-        "revised_text": (
-            "English Paragraph 1: Energy prices surged then retreated as signals conflicted.\n"
-            "中文段落 1：在互相矛盾的政策与供应信号下，能源价格先升后回。\n\n"
-            "English Paragraph 2: Traders repriced risk after fresh supply narratives.\n"
-            "中文段落 2：新的供给叙事出现后，交易员重新定价风险。"
+        "schema_version": "2.0",
+        "revision": {
+            "title_revised_en": article.get("title", ""),
+            "paragraphs_revised_en": paragraphs,
+            "captions_revised_en": article.get("captions", []),
+            "subtitles_en": [{"insert_before_paragraph": 1, "subtitle": "Market Shock And Repricing"}],
+        },
+        "revision_meta": {
+            "used_verifier": True,
+            "resolved_entities": 1,
+            "unresolved_entities": 1,
+            "total_parts": 1,
+            "degraded_reason": None,
+        },
+        "revision_outline": {
+            "schema_version": "1.0",
+            "total_paragraphs": 2,
+            "title_revised_en": article.get("title", ""),
+            "entity_mapping_used": True,
+            "parts": [
+                {
+                    "part_id": 1,
+                    "subtitle_en": "Market Shock And Repricing",
+                    "summary": "市场波动与风险重估。",
+                    "paragraph_ids": [1, 2],
+                }
+            ],
+        },
+        "revised_text": "\n\n".join(
+            ["Market Shock And Repricing", *paragraphs]
         ),
         "title_limit": 12,
         "caption_limit": 25,
@@ -164,13 +193,33 @@ def build_mock_verifier_output() -> dict:
 def build_mock_docx(output_dir: str | Path, run_id: str, article: dict, revised: dict) -> Path:
     output_file = Path(output_dir) / f"{run_id}.docx"
     formatter = DocxFormatter()
+    revision_block = revised.get("revision", {})
+    if not isinstance(revision_block, dict):
+        revision_block = {}
+    revised_paragraphs = [
+        str(item).strip()
+        for item in revision_block.get("paragraphs_revised_en", [])
+        if str(item).strip()
+    ]
+    source_paragraphs = [str(item).strip() for item in article.get("body_paragraphs", []) if str(item).strip()]
+    body_blocks: list[str] = []
+    for idx, paragraph_en in enumerate(revised_paragraphs, start=1):
+        paragraph_zh = source_paragraphs[idx - 1] if idx - 1 < len(source_paragraphs) else ""
+        pair_lines = [f"译文：{paragraph_en}"]
+        if paragraph_zh:
+            pair_lines.append(f"原文：{paragraph_zh}")
+        body_blocks.append("\n".join(pair_lines).strip())
+    if not body_blocks:
+        fallback = str(revised.get("revised_text", "")).strip()
+        body_blocks = [fallback] if fallback else []
+
     formatter.build(
         output_path=output_file,
-        title_en=article.get("title", ""),
+        title_en=str(revision_block.get("title_revised_en", "")).strip() or article.get("title", ""),
         author_en=article.get("author", ""),
-        body_blocks=[revised.get("revised_text", "")],
+        body_blocks=body_blocks,
         ending_author_zh=article.get("author", ""),
-        captions_blocks=article.get("captions", []),
+        captions_blocks=revision_block.get("captions_revised_en", []) or article.get("captions", []),
     )
     return output_file
 

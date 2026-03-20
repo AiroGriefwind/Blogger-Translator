@@ -30,7 +30,10 @@ class PipelineOrchestrator:
             max_retries=self.settings.siliconflow_max_retries,
         )
         self.translator = TranslateStage(
-            self.client, temperature=self.settings.siliconflow_temperature
+            self.client,
+            temperature=self.settings.siliconflow_temperature,
+            chunk_enabled=self.settings.translator_chunk_enabled,
+            chunk_max_paragraphs=self.settings.translator_chunk_max_paragraphs,
         )
         self.revisor = RevisionStage(self.client)
         self.verifier = VerifyStage(self.client, temperature=self.settings.siliconflow_temperature)
@@ -63,6 +66,18 @@ class PipelineOrchestrator:
             translated = self.translator.run(scraped)
             translated_uri = self.repo.save_translation(run_id, translated)
             run_log["artifacts"]["translated_uri"] = translated_uri
+            chunk_metrics = translated.get("chunk_metrics", {})
+            chunk_events = translated.get("chunk_events", [])
+            if isinstance(chunk_metrics, dict) and chunk_metrics:
+                translator_metrics_uri = self.repo.save_log(
+                    run_id, "translator_chunk_metrics", chunk_metrics
+                )
+                run_log["artifacts"]["translator_chunk_metrics_uri"] = translator_metrics_uri
+            if isinstance(chunk_events, list) and chunk_events:
+                translator_events_uri = self.repo.save_log(
+                    run_id, "translator_chunk_events", {"events": chunk_events}
+                )
+                run_log["artifacts"]["translator_chunk_events_uri"] = translator_events_uri
             self._step_success(run_log, active_step, active_step_started_at)
             active_step = None
 
@@ -80,7 +95,11 @@ class PipelineOrchestrator:
 
             active_step = "revise"
             active_step_started_at = self._step_running(run_log, active_step)
-            revised = self.revisor.run(scraped, translated)
+            revised = self.revisor.run(scraped, translated, verifier_output)
+            revision_outline = revised.get("revision_outline")
+            if isinstance(revision_outline, dict) and revision_outline:
+                outline_uri = self.repo.save_log(run_id, "revision_outline", revision_outline)
+                run_log["artifacts"]["revision_outline_uri"] = outline_uri
             revised_uri = self.repo.save_revision(run_id, revised)
             run_log["artifacts"]["revised_uri"] = revised_uri
             self._step_success(run_log, active_step, active_step_started_at)
@@ -89,13 +108,16 @@ class PipelineOrchestrator:
             active_step = "format"
             active_step_started_at = self._step_running(run_log, active_step)
             output_file = Path(output_dir) / f"{run_id}.docx"
+            revision_block = revised.get("revision", {})
+            if not isinstance(revision_block, dict):
+                revision_block = {}
             self.formatter.build(
                 output_path=output_file,
-                title_en=f"{scraped.get('title', '')}",
+                title_en=str(revision_block.get("title_revised_en", "")).strip() or f"{scraped.get('title', '')}",
                 author_en=scraped.get("author", ""),
-                body_blocks=[revised.get("revised_text", "")],
+                body_blocks=self._build_formatter_body_blocks(scraped, revised),
                 ending_author_zh=scraped.get("author", ""),
-                captions_blocks=scraped.get("captions", []),
+                captions_blocks=self._build_formatter_captions(scraped, revised),
             )
             run_log["artifacts"]["docx_local_path"] = str(output_file)
             self._step_success(run_log, active_step, active_step_started_at)
@@ -166,6 +188,7 @@ class PipelineOrchestrator:
                 "translated_uri": None,
                 "name_questions_uri": None,
                 "verifier_entities_uri": None,
+                "revision_outline_uri": None,
                 "revised_uri": None,
                 "docx_local_path": None,
                 "docx_cloud_path": None,
@@ -226,4 +249,62 @@ class PipelineOrchestrator:
                 status = "verified" if entity.get("is_verified", False) else "unverified"
                 questions.append(f"[p{paragraph_id}] {entity_zh} / {entity_en} -> {status}")
         return questions
+
+    @staticmethod
+    def _build_formatter_body_blocks(scraped: dict[str, Any], revised: dict[str, Any]) -> list[str]:
+        revision_block = revised.get("revision", {})
+        if not isinstance(revision_block, dict):
+            revision_block = {}
+        revised_paragraphs = PipelineOrchestrator._as_string_list(
+            revision_block.get("paragraphs_revised_en", [])
+        )
+        if not revised_paragraphs:
+            revised_paragraphs = PipelineOrchestrator._as_string_list(
+                str(revised.get("revised_text", "")).split("\n\n")
+            )
+        source_paragraphs = PipelineOrchestrator._as_string_list(scraped.get("body_paragraphs", []))
+        subtitle_map: dict[int, str] = {}
+        for item in revision_block.get("subtitles_en", []):
+            if not isinstance(item, dict):
+                continue
+            subtitle = str(item.get("subtitle", "")).strip()
+            if not subtitle:
+                continue
+            try:
+                insert_before = int(item.get("insert_before_paragraph", 0))
+            except (TypeError, ValueError):
+                continue
+            if insert_before > 0:
+                subtitle_map[insert_before] = subtitle
+
+        blocks: list[str] = []
+        for idx, revised_en in enumerate(revised_paragraphs, start=1):
+            if idx in subtitle_map:
+                blocks.append(subtitle_map[idx])
+            source_zh = source_paragraphs[idx - 1] if idx - 1 < len(source_paragraphs) else ""
+            pair_lines = [f"译文：{revised_en}"]
+            if source_zh:
+                pair_lines.append(f"原文：{source_zh}")
+            blocks.append("\n".join(pair_lines).strip())
+        if blocks:
+            return blocks
+        fallback = str(revised.get("revised_text", "")).strip()
+        return [fallback] if fallback else []
+
+    @staticmethod
+    def _build_formatter_captions(scraped: dict[str, Any], revised: dict[str, Any]) -> list[str]:
+        revision_block = revised.get("revision", {})
+        if isinstance(revision_block, dict):
+            revised_captions = PipelineOrchestrator._as_string_list(
+                revision_block.get("captions_revised_en", [])
+            )
+            if revised_captions:
+                return revised_captions
+        return PipelineOrchestrator._as_string_list(scraped.get("captions", []))
+
+    @staticmethod
+    def _as_string_list(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
 

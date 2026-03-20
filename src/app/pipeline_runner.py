@@ -50,6 +50,7 @@ class PipelineRunner:
         options: RunnerOptions,
         on_stage_update: Callable[[str, str, str], None] | None = None,
         on_verifier_progress: Callable[[dict], None] | None = None,
+        on_translator_progress: Callable[[dict], None] | None = None,
         run_until_stage: str | None = None,
     ) -> dict:
         if not url.strip():
@@ -62,6 +63,11 @@ class PipelineRunner:
         error: dict | None = None
         runtime = {
             "verify_progress": {"done": 0, "total": 0, "percent": 0.0},
+            "translator_progress": {
+                "total_chunks": 0,
+                "current_chunk": 0,
+                "total_retries": 0,
+            },
             "logs": [],
         }
         should_stop_after = run_until_stage if run_until_stage in STAGE_ORDER else None
@@ -89,12 +95,44 @@ class PipelineRunner:
             if on_verifier_progress:
                 on_verifier_progress(payload)
 
+        def emit_translator_progress(payload: dict) -> None:
+            event = str(payload.get("event", "")).strip()
+            if event == "translator_start":
+                runtime["translator_progress"]["total_chunks"] = int(payload.get("total_chunks", 0))
+                runtime["translator_progress"]["current_chunk"] = 0
+                runtime["translator_progress"]["total_retries"] = 0
+            elif event == "chunk_started":
+                runtime["translator_progress"]["current_chunk"] = int(payload.get("chunk_id", 0))
+            elif event == "chunk_retry":
+                runtime["translator_progress"]["total_retries"] = int(
+                    runtime["translator_progress"].get("total_retries", 0)
+                ) + 1
+            elif event == "translator_done":
+                runtime["translator_progress"]["total_chunks"] = int(payload.get("total_chunks", 0))
+
+            message = str(payload.get("message", "")).strip()
+            if message:
+                runtime["logs"].append(
+                    {
+                        "time": strftime("%H:%M:%S"),
+                        "stage": "translator",
+                        "message": message,
+                    }
+                )
+            if on_translator_progress:
+                on_translator_progress(payload)
+
         try:
             scraped = self._run_scraper(url, options, emit)
             stage_outputs["scraped"] = scraped
             self._maybe_stop("scraper", should_stop_after, stage_states)
 
-            translated = self._run_translator(scraped, options, emit)
+            translated = self._run_translator(
+                scraped,
+                options,
+                emit,
+                on_translator_progress=emit_translator_progress,
+            )
             stage_outputs["translated"] = translated
             self._maybe_stop("translator", should_stop_after, stage_states)
 
@@ -109,7 +147,7 @@ class PipelineRunner:
             stage_outputs["name_questions"] = self._build_compat_name_questions(verifier_output)
             self._maybe_stop("verifier", should_stop_after, stage_states)
 
-            revised = self._run_revisor(scraped, translated, options, emit)
+            revised = self._run_revisor(scraped, translated, verifier_output, options, emit)
             stage_outputs["revised"] = revised
             self._maybe_stop("revisor", should_stop_after, stage_states)
 
@@ -185,7 +223,13 @@ class PipelineRunner:
         emit("scraper", "mocked", "使用 mock 抓取数据")
         return scraped
 
-    def _run_translator(self, scraped: dict, options: RunnerOptions, emit: Callable) -> dict:
+    def _run_translator(
+        self,
+        scraped: dict,
+        options: RunnerOptions,
+        emit: Callable,
+        on_translator_progress: Callable[[dict], None] | None = None,
+    ) -> dict:
         emit("translator", "running", "正在进行首轮翻译...")
         self._maybe_fail("translator", options.mock_fail_stage)
         if options.use_real_llm:
@@ -198,12 +242,26 @@ class PipelineRunner:
                 timeout=env["SILICONFLOW_TIMEOUT_SECONDS"],
                 max_retries=env["SILICONFLOW_MAX_RETRIES"],
             )
-            translated = TranslateStage(client, temperature=env["SILICONFLOW_TEMPERATURE"]).run(
-                scraped
-            )
+            translated = TranslateStage(
+                client,
+                temperature=env["SILICONFLOW_TEMPERATURE"],
+                chunk_enabled=bool(env["TRANSLATOR_CHUNK_ENABLED"]),
+                chunk_max_paragraphs=int(env["TRANSLATOR_CHUNK_MAX_PARAGRAPHS"]),
+            ).run(scraped, on_progress=on_translator_progress)
             emit("translator", "success", "真实 LLM 翻译完成")
             return translated
         translated = build_mock_translated(scraped)
+        if on_translator_progress:
+            on_translator_progress(
+                {
+                    "event": "translator_done",
+                    "mode": "mock",
+                    "total_chunks": 1,
+                    "total_attempts": 1,
+                    "total_retries": 0,
+                    "message": "翻译完成：mock 模式。",
+                }
+            )
         emit("translator", "mocked", "使用 mock 翻译结果")
         return translated
 
@@ -286,7 +344,14 @@ class PipelineRunner:
         emit("verifier", "mocked", f"使用 mock 核验结果（{len(mock_questions)} 条）")
         return verifier_output
 
-    def _run_revisor(self, scraped: dict, translated: dict, options: RunnerOptions, emit: Callable) -> dict:
+    def _run_revisor(
+        self,
+        scraped: dict,
+        translated: dict,
+        verifier_output: dict,
+        options: RunnerOptions,
+        emit: Callable,
+    ) -> dict:
         emit("revisor", "running", "正在进行二轮润色...")
         self._maybe_fail("revisor", options.mock_fail_stage)
         if options.use_real_llm:
@@ -299,7 +364,7 @@ class PipelineRunner:
                 timeout=env["SILICONFLOW_TIMEOUT_SECONDS"],
                 max_retries=env["SILICONFLOW_MAX_RETRIES"],
             )
-            revised = RevisionStage(client).run(scraped, translated)
+            revised = RevisionStage(client).run(scraped, translated, verifier_output)
             revised["placeholder_note"] = "长度控制逻辑已预留，当前仍由下游后端完善。"
             emit("revisor", "success", "真实 LLM 润色完成")
             return revised
@@ -323,13 +388,16 @@ class PipelineRunner:
             emit("formatter", "mocked", "使用 mock 文本生成 docx")
             return output_file
         output_file = Path(output_dir) / f"{run_id}.docx"
+        revision_block = revised.get("revision", {})
+        if not isinstance(revision_block, dict):
+            revision_block = {}
         DocxFormatter().build(
             output_path=output_file,
-            title_en=f"{scraped.get('title', '')}",
+            title_en=str(revision_block.get("title_revised_en", "")).strip() or f"{scraped.get('title', '')}",
             author_en=scraped.get("author", ""),
-            body_blocks=[revised.get("revised_text", "")],
+            body_blocks=self._build_formatter_body_blocks(scraped, revised),
             ending_author_zh=scraped.get("author", ""),
-            captions_blocks=scraped.get("captions", []),
+            captions_blocks=self._build_formatter_captions(scraped, revised),
         )
         emit("formatter", "success", "docx 已生成")
         return output_file
@@ -353,12 +421,21 @@ class PipelineRunner:
             repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
             repo.save_raw_article(run_id, scraped)
             repo.save_translation(run_id, translated)
+            chunk_metrics = translated.get("chunk_metrics", {})
+            chunk_events = translated.get("chunk_events", [])
+            if isinstance(chunk_metrics, dict) and chunk_metrics:
+                repo.save_log(run_id, "translator_chunk_metrics", chunk_metrics)
+            if isinstance(chunk_events, list) and chunk_events:
+                repo.save_log(run_id, "translator_chunk_events", {"events": chunk_events})
             repo.save_log(run_id, "verifier_entities", verifier_output)
             repo.save_log(
                 run_id,
                 "name_questions",
                 {"questions": self._build_compat_name_questions(verifier_output)},
             )
+            revision_outline = revised.get("revision_outline")
+            if isinstance(revision_outline, dict) and revision_outline:
+                repo.save_log(run_id, "revision_outline", revision_outline)
             repo.save_revision(run_id, revised)
             cloud_path = repo.save_output_docx(run_id, str(output_file))
             emit("storage", "success", "已上传到 Firebase Storage")
@@ -368,7 +445,7 @@ class PipelineRunner:
         return cloud_path
 
     @staticmethod
-    def _load_runtime_env(model_override: str = "") -> dict[str, str | int | float]:
+    def _load_runtime_env(model_override: str = "") -> dict[str, str | int | float | bool]:
         base_url = (
             os.getenv("SILICONFLOW_BASE_URL", "").strip()
             or os.getenv("LLM_BASE_URL", "").strip()
@@ -404,6 +481,12 @@ class PipelineRunner:
         temperature = PipelineRunner._read_float_env(
             "SILICONFLOW_TEMPERATURE", "LLM_TEMPERATURE", 0.2
         )
+        translator_chunk_enabled = PipelineRunner._read_bool_env(
+            "TRANSLATOR_CHUNK_ENABLED", True
+        )
+        translator_chunk_max_paragraphs = PipelineRunner._read_int_env(
+            "TRANSLATOR_CHUNK_MAX_PARAGRAPHS", "", 5
+        )
         return {
             "SILICONFLOW_API_KEY": api_key,
             "SILICONFLOW_BASE_URL": base_url,
@@ -411,6 +494,8 @@ class PipelineRunner:
             "SILICONFLOW_TEMPERATURE": temperature,
             "SILICONFLOW_TIMEOUT_SECONDS": timeout_seconds,
             "SILICONFLOW_MAX_RETRIES": max_retries,
+            "TRANSLATOR_CHUNK_ENABLED": translator_chunk_enabled,
+            "TRANSLATOR_CHUNK_MAX_PARAGRAPHS": translator_chunk_max_paragraphs,
             "FIREBASE_STORAGE_BUCKET": os.getenv("FIREBASE_STORAGE_BUCKET", "").strip(),
             "GOOGLE_APPLICATION_CREDENTIALS": os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip(),
         }
@@ -425,7 +510,9 @@ class PipelineRunner:
 
     @staticmethod
     def _read_int_env(primary_key: str, fallback_key: str, default: int) -> int:
-        raw = os.getenv(primary_key, "").strip() or os.getenv(fallback_key, "").strip()
+        raw = os.getenv(primary_key, "").strip()
+        if not raw and fallback_key:
+            raw = os.getenv(fallback_key, "").strip()
         if not raw:
             return default
         try:
@@ -442,6 +529,17 @@ class PipelineRunner:
             return float(raw)
         except ValueError as exc:
             raise SettingsError(f"{primary_key}/{fallback_key} 必须是数字") from exc
+
+    @staticmethod
+    def _read_bool_env(primary_key: str, default: bool) -> bool:
+        raw = os.getenv(primary_key, "").strip().lower()
+        if not raw:
+            return default
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        raise SettingsError(f"{primary_key} 必须是布尔值(true/false)")
 
     @staticmethod
     def _validate_storage_env(env: dict[str, str]) -> None:
@@ -479,6 +577,64 @@ class PipelineRunner:
                 status = "verified" if entity.get("is_verified", False) else "unverified"
                 questions.append(f"[p{pid}] {entity_zh} / {entity_en} -> {status}")
         return questions
+
+    @staticmethod
+    def _build_formatter_body_blocks(scraped: dict, revised: dict) -> list[str]:
+        revision_block = revised.get("revision", {})
+        if not isinstance(revision_block, dict):
+            revision_block = {}
+        revised_paragraphs = PipelineRunner._as_string_list(
+            revision_block.get("paragraphs_revised_en", [])
+        )
+        if not revised_paragraphs:
+            revised_paragraphs = PipelineRunner._as_string_list(
+                str(revised.get("revised_text", "")).split("\n\n")
+            )
+        source_paragraphs = PipelineRunner._as_string_list(scraped.get("body_paragraphs", []))
+        subtitle_map: dict[int, str] = {}
+        for item in revision_block.get("subtitles_en", []):
+            if not isinstance(item, dict):
+                continue
+            subtitle = str(item.get("subtitle", "")).strip()
+            if not subtitle:
+                continue
+            try:
+                insert_before = int(item.get("insert_before_paragraph", 0))
+            except (TypeError, ValueError):
+                continue
+            if insert_before > 0:
+                subtitle_map[insert_before] = subtitle
+
+        blocks: list[str] = []
+        for idx, revised_en in enumerate(revised_paragraphs, start=1):
+            if idx in subtitle_map:
+                blocks.append(subtitle_map[idx])
+            source_zh = source_paragraphs[idx - 1] if idx - 1 < len(source_paragraphs) else ""
+            pair_lines = [f"译文：{revised_en}"]
+            if source_zh:
+                pair_lines.append(f"原文：{source_zh}")
+            blocks.append("\n".join(pair_lines).strip())
+        if blocks:
+            return blocks
+        fallback = str(revised.get("revised_text", "")).strip()
+        return [fallback] if fallback else []
+
+    @staticmethod
+    def _build_formatter_captions(scraped: dict, revised: dict) -> list[str]:
+        revision_block = revised.get("revision", {})
+        if isinstance(revision_block, dict):
+            revised_captions = PipelineRunner._as_string_list(
+                revision_block.get("captions_revised_en", [])
+            )
+            if revised_captions:
+                return revised_captions
+        return PipelineRunner._as_string_list(scraped.get("captions", []))
+
+    @staticmethod
+    def _as_string_list(value) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
 
     def write_verified_entities_to_online_db(self, run_id: str, verifier_output: dict) -> dict[str, int]:
         env = self._load_runtime_env()
@@ -701,3 +857,8 @@ class PipelineRunner:
         repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
         return repo.apply_pending_changes(run_id=run_id)
 
+    def upsert_single_entity_to_online_db(self, run_id: str, entity: dict) -> dict[str, int]:
+        env = self._load_runtime_env()
+        self._validate_storage_env(env)
+        repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
+        return repo.upsert_single_verified_entity(run_id=run_id, entity=entity)

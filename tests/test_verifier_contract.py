@@ -54,6 +54,6 @@ def test_extract_translated_paragraphs_prefers_json_contract() -> None:
 def test_extract_translated_paragraphs_fallback_to_blankline_split() -> None:
     stage = VerifyStage(client=_DummyClient())
     parsed = stage._extract_translated_paragraphs(  # pylint: disable=protected-access
-        {"translated_text": "Para 1\\n\\nPara 2\\n\\nPara 3"}
+        {"translated_text": "Para 1\n\nPara 2\n\nPara 3"}
     )
     assert parsed == ["Para 1", "Para 2", "Para 3"]
