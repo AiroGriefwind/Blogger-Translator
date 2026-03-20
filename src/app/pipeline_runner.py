@@ -7,6 +7,7 @@ import os
 import traceback
 from time import strftime
 from typing import Callable
+from copy import deepcopy
 
 from app.mock_pipeline import (
     build_mock_docx,
@@ -27,6 +28,7 @@ from storage.repositories import RunRepository
 from translator.siliconflow_client import SiliconFlowClient
 from translator.translate_stage import TranslateStage
 from verifier.verify_stage import VerifyStage
+from verifier.synonym_review_stage import SynonymReviewStage
 
 
 @dataclass
@@ -291,7 +293,7 @@ class PipelineRunner:
             def lookup_exact(entity: dict) -> dict | None:
                 if not repo or not options.use_entity_db_lookup:
                     return None
-                return repo.find_entity_exact(entity)
+                return repo.find_entity_by_synonym_set(entity)
 
             verifier_output = VerifyStage(client, temperature=env["SILICONFLOW_TEMPERATURE"]).run(
                 scraped,
@@ -639,6 +641,221 @@ class PipelineRunner:
         self._validate_storage_env(env)
         repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
         return repo.upsert_verified_entities(run_id=run_id, verifier_output=verifier_output)
+
+    def list_online_verified_entities(self) -> list[dict]:
+        env = self._load_runtime_env()
+        self._validate_storage_env(env)
+        repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
+        return repo.list_verified_entities()
+
+    def list_online_all_entities(self) -> list[dict]:
+        env = self._load_runtime_env()
+        self._validate_storage_env(env)
+        repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
+        return repo.list_all_entities()
+
+    def get_synonym_review_snapshot(self) -> dict:
+        env = self._load_runtime_env()
+        self._validate_storage_env(env)
+        repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
+        return {
+            "state": repo.load_review_state(),
+            "results": repo.load_review_results(),
+            "pending": repo.load_pending_changes(),
+        }
+
+    def run_synonym_review_batch(
+        self,
+        *,
+        language_mode: str,
+        category: str,
+        llm_model: str = "",
+        new_batch_size: int = 20,
+        reviewed_batch_size: int = 50,
+    ) -> dict:
+        env = self._load_runtime_env(model_override=llm_model)
+        self._validate_llm_env(env)
+        self._validate_storage_env(env)
+        repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
+        state = repo.load_review_state()
+        results = repo.load_review_results()
+        all_entities = repo.list_all_entities()
+        scoped = [item for item in all_entities if str(item.get("type", "")) == category]
+        reviewed_field = "synonym_reviewed_zh" if language_mode == "zh" else "synonym_reviewed_en"
+        reviewed_entities = [item for item in scoped if bool(item.get(reviewed_field, False))]
+        new_entities = [item for item in scoped if not bool(item.get(reviewed_field, False))]
+
+        active = state.get("active", {})
+        if not isinstance(active, dict):
+            active = {}
+        should_reinit = (
+            active.get("language_mode") != language_mode
+            or active.get("category") != category
+            or not isinstance(active.get("new_keys", []), list)
+        )
+        if should_reinit:
+            active = {
+                "language_mode": language_mode,
+                "category": category,
+                "new_keys": [str(item.get("key", "")) for item in new_entities[: max(new_batch_size, 1)]],
+                "reviewed_offset": 0,
+                "new_offset": max(new_batch_size, 1),
+                "new_batch_size": max(new_batch_size, 1),
+                "reviewed_batch_size": max(reviewed_batch_size, 1),
+            }
+        new_keys = [str(item) for item in active.get("new_keys", []) if str(item).strip()]
+        if not new_keys:
+            return {
+                "ok": True,
+                "message": "当前分类和语言下没有待审查新词。",
+                "state": state,
+                "results": results,
+            }
+
+        reviewed_offset = int(active.get("reviewed_offset", 0))
+        reviewed_batch_size = int(active.get("reviewed_batch_size", reviewed_batch_size))
+        reviewed_slice = reviewed_entities[reviewed_offset : reviewed_offset + max(reviewed_batch_size, 1)]
+        if not reviewed_slice:
+            return {
+                "ok": True,
+                "message": "已无可比较的已审查词条，请直接进入人工处理。",
+                "state": state,
+                "results": results,
+            }
+
+        key_to_entity = {str(item.get("key", "")): item for item in scoped}
+        new_batch = [key_to_entity[key] for key in new_keys if key in key_to_entity]
+        stage = SynonymReviewStage(
+            SiliconFlowClient(
+                api_key=env["SILICONFLOW_API_KEY"],
+                base_url=env["SILICONFLOW_BASE_URL"],
+                model=env["SILICONFLOW_MODEL"],
+                timeout=env["SILICONFLOW_TIMEOUT_SECONDS"],
+                max_retries=env["SILICONFLOW_MAX_RETRIES"],
+            ),
+            temperature=env["SILICONFLOW_TEMPERATURE"],
+        )
+        stage_output = stage.run(
+            language_mode=language_mode,
+            category=category,
+            new_items=[
+                {
+                    "id": item.get("key", ""),
+                    "entity_zh": item.get("entity_zh", ""),
+                    "entity_en": item.get("entity_en", ""),
+                    "zh_aliases": item.get("zh_aliases", []),
+                    "en_aliases": item.get("en_aliases", []),
+                    "type": item.get("type", ""),
+                }
+                for item in new_batch
+            ],
+            reviewed_items_batch=[
+                {
+                    "id": item.get("key", ""),
+                    "entity_zh": item.get("entity_zh", ""),
+                    "entity_en": item.get("entity_en", ""),
+                    "zh_aliases": item.get("zh_aliases", []),
+                    "en_aliases": item.get("en_aliases", []),
+                    "type": item.get("type", ""),
+                }
+                for item in reviewed_slice
+            ],
+            known_synonym_groups=[
+                {
+                    "id": item.get("key", ""),
+                    "zh_aliases": item.get("zh_aliases", []),
+                    "en_aliases": item.get("en_aliases", []),
+                }
+                for item in reviewed_slice
+            ],
+        )
+        result_rows = results.get("results", [])
+        if not isinstance(result_rows, list):
+            result_rows = []
+        result_rows.append(
+            {
+                "saved_at": datetime.utcnow().isoformat(),
+                "language_mode": language_mode,
+                "category": category,
+                "reviewed_offset": reviewed_offset,
+                "reviewed_batch_size": reviewed_batch_size,
+                "new_keys": new_keys,
+                "output": stage_output,
+            }
+        )
+        results["results"] = result_rows
+        repo.save_review_results(results)
+
+        active["reviewed_offset"] = reviewed_offset + len(reviewed_slice)
+        current_new_offset = int(active.get("new_offset", len(new_keys)))
+        if active["reviewed_offset"] >= len(reviewed_entities):
+            next_batch = new_entities[current_new_offset : current_new_offset + max(new_batch_size, 1)]
+            active["new_keys"] = [str(item.get("key", "")) for item in next_batch]
+            active["new_offset"] = current_new_offset + len(next_batch)
+            active["reviewed_offset"] = 0
+        active["updated_at"] = datetime.utcnow().isoformat()
+        state["active"] = active
+        state["language_mode"] = language_mode
+        state["category"] = category
+        state["new_batch_size"] = int(active.get("new_batch_size", new_batch_size))
+        state["reviewed_batch_size"] = reviewed_batch_size
+        history = state.get("history", [])
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "saved_at": datetime.utcnow().isoformat(),
+                "language_mode": language_mode,
+                "category": category,
+                "reviewed_offset": active["reviewed_offset"],
+                "new_keys": new_keys,
+            }
+        )
+        state["history"] = history[-100:]
+        repo.save_review_state(state)
+        return {
+            "ok": True,
+            "message": "已完成一批同义词审查。",
+            "state": state,
+            "results": results,
+            "output": stage_output,
+        }
+
+    def add_pending_change(self, item: dict) -> dict:
+        env = self._load_runtime_env()
+        self._validate_storage_env(env)
+        repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
+        pending = repo.load_pending_changes()
+        items = pending.get("items", [])
+        if not isinstance(items, list):
+            items = []
+        new_item = deepcopy(item)
+        new_item["status"] = str(new_item.get("status", "pending"))
+        new_item["saved_at"] = datetime.utcnow().isoformat()
+        items.append(new_item)
+        pending["items"] = items
+        repo.save_pending_changes(pending)
+        return pending
+
+    def remove_pending_change(self, index: int) -> dict:
+        env = self._load_runtime_env()
+        self._validate_storage_env(env)
+        repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
+        pending = repo.load_pending_changes()
+        items = pending.get("items", [])
+        if not isinstance(items, list):
+            items = []
+        if 0 <= index < len(items):
+            items.pop(index)
+        pending["items"] = items
+        repo.save_pending_changes(pending)
+        return pending
+
+    def apply_pending_changes_to_online_db(self, run_id: str) -> dict:
+        env = self._load_runtime_env()
+        self._validate_storage_env(env)
+        repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
+        return repo.apply_pending_changes(run_id=run_id)
 
     def upsert_single_entity_to_online_db(self, run_id: str, entity: dict) -> dict[str, int]:
         env = self._load_runtime_env()

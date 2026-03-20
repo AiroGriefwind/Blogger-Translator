@@ -6,6 +6,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 import re
+from uuid import uuid4
 
 import streamlit as st
 
@@ -16,11 +17,6 @@ if str(SRC_ROOT) not in sys.path:
 
 from app.pipeline_runner import PipelineRunner, RunnerOptions
 from app.ui_state import STAGE_ORDER, init_ui_state, reset_pipeline_state, update_from_run_result
-from app.verifier_ui_utils import (
-    build_entity_groups,
-    build_entity_search_terms,
-    build_replacement_candidates,
-)
 from config.settings import SettingsError
 
 
@@ -61,69 +57,294 @@ def _render_stage_board(stage_states: dict) -> None:
     st.markdown(_stage_board_markdown(stage_states))
 
 
-def _as_text_list(value) -> list[str]:
-    if not isinstance(value, list):
+def _normalize_search_text(value: str) -> str:
+    text = str(value).strip().lower()
+    if not text:
+        return ""
+    return re.sub(r"[\s\-_/\\|,;:(){}\[\]<>\"'`。，“”‘’！？、]+", "", text)
+
+
+def _filter_online_entities(
+    rows: list[dict],
+    search_field: str,
+    keyword: str,
+    category: str,
+    review_scope: str = "全部",
+) -> list[dict]:
+    normalized_keyword = _normalize_search_text(keyword)
+    filtered: list[dict] = []
+    for row in rows:
+        row_type = str(row.get("type", "other")).strip() or "other"
+        if category != "全部" and row_type != category:
+            continue
+        reviewed_zh = bool(row.get("synonym_reviewed_zh", False))
+        reviewed_en = bool(row.get("synonym_reviewed_en", False))
+        if review_scope == "新内容" and (reviewed_zh and reviewed_en):
+            continue
+        if review_scope == "老内容" and not (reviewed_zh and reviewed_en):
+            continue
+        haystack = str(row.get(search_field, ""))
+        if normalized_keyword and normalized_keyword not in _normalize_search_text(haystack):
+            continue
+        filtered.append(row)
+    return filtered
+
+
+def _find_pending_index_by_action_key(pending_items: list[dict], action: str, key: str) -> int | None:
+    for idx, item in enumerate(pending_items):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("status", "pending")) != "pending":
+            continue
+        if str(item.get("action", "")) != action:
+            continue
+        selector = item.get("selector", {})
+        if not isinstance(selector, dict):
+            continue
+        if str(selector.get("key", "")) == key:
+            return idx
+    return None
+
+
+def _build_pending_maps(pending_items: list[dict]) -> tuple[set[str], dict[str, dict]]:
+    delete_keys: set[str] = set()
+    update_map: dict[str, dict] = {}
+    for item in pending_items:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("status", "pending")) != "pending":
+            continue
+        action = str(item.get("action", ""))
+        selector = item.get("selector", {})
+        if not isinstance(selector, dict):
+            continue
+        key = str(selector.get("key", "")).strip()
+        if not key:
+            continue
+        if action == "delete_record":
+            delete_keys.add(key)
+        if action == "update_record":
+            update_map[key] = item
+    return delete_keys, update_map
+
+
+def _parse_sources_from_json(text: str) -> list[dict]:
+    if not text.strip():
         return []
-    return [str(item).strip() for item in value if str(item).strip()]
-
-
-def _build_revisor_pairs(scraped: dict, revised: dict) -> tuple[list[dict], list[dict]]:
-    revision = revised.get("revision", {})
-    if not isinstance(revision, dict):
-        revision = {}
-
-    revised_paragraphs = _as_text_list(revision.get("paragraphs_revised_en", []))
-    if not revised_paragraphs:
-        revised_paragraphs = [block.strip() for block in str(revised.get("revised_text", "")).split("\n\n") if block.strip()]
-
-    source_paragraphs = _as_text_list(scraped.get("body_paragraphs", []))
-    pairs: list[dict] = []
-    for idx, revised_en in enumerate(revised_paragraphs, start=1):
-        source_zh = source_paragraphs[idx - 1] if idx - 1 < len(source_paragraphs) else ""
-        pairs.append({"paragraph_id": idx, "en": revised_en, "zh": source_zh})
-
-    outline = revised.get("revision_outline", {})
-    parts = outline.get("parts", []) if isinstance(outline, dict) else []
-    normalized_parts: list[dict] = []
-    used_ids: set[int] = set()
-    if isinstance(parts, list):
-        for part in parts:
-            if not isinstance(part, dict):
-                continue
-            raw_ids = part.get("paragraph_ids", [])
-            if not isinstance(raw_ids, list):
-                continue
-            ids: list[int] = []
-            for raw in raw_ids:
-                try:
-                    pid = int(raw)
-                except (TypeError, ValueError):
-                    continue
-                if 1 <= pid <= len(pairs):
-                    ids.append(pid)
-            if not ids:
-                continue
-            normalized_parts.append(
-                {
-                    "part_id": int(part.get("part_id", len(normalized_parts) + 1)),
-                    "subtitle_en": str(part.get("subtitle_en", "")).strip(),
-                    "paragraph_ids": ids,
-                }
-            )
-            used_ids.update(ids)
-
-    missing_ids = [idx for idx in range(1, len(pairs) + 1) if idx not in used_ids]
-    if missing_ids:
-        normalized_parts.append(
+    parsed = json.loads(text)
+    if not isinstance(parsed, list):
+        return []
+    cleaned: list[dict] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        cleaned.append(
             {
-                "part_id": len(normalized_parts) + 1,
-                "subtitle_en": "",
-                "paragraph_ids": missing_ids,
+                "url": str(item.get("url", "")).strip(),
+                "site": str(item.get("site", "")).strip(),
+                "evidence_note": str(item.get("evidence_note", "")).strip(),
             }
         )
-    if not normalized_parts and pairs:
-        normalized_parts = [{"part_id": 1, "subtitle_en": "", "paragraph_ids": list(range(1, len(pairs) + 1))}]
-    return pairs, normalized_parts
+    return cleaned
+
+
+def _render_online_entity_cards(
+    rows: list[dict],
+    pending_items: list[dict],
+    runner: PipelineRunner,
+) -> None:
+    delete_keys, update_map = _build_pending_maps(pending_items)
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        row_type = str(row.get("type", "other")).strip() or "other"
+        grouped.setdefault(row_type, []).append(row)
+
+    ordered_types = sorted(grouped.keys(), key=lambda item: (-len(grouped[item]), item))
+    if not ordered_types:
+        st.info("没有匹配到词条。")
+        return
+
+    for entity_type in ordered_types:
+        items = grouped[entity_type]
+        with st.expander(f"{entity_type}（{len(items)}）", expanded=False):
+            for item in items:
+                key = str(item.get("key", "")).strip()
+                pending_delete = key in delete_keys
+                pending_update = update_map.get(key)
+                display_item = dict(item)
+                changed_fields: set[str] = set()
+                if isinstance(pending_update, dict):
+                    record = pending_update.get("record", {})
+                    if isinstance(record, dict):
+                        for field in [
+                            "entity_zh",
+                            "entity_en",
+                            "type",
+                            "final_recommendation",
+                            "zh_aliases",
+                            "en_aliases",
+                            "sources",
+                        ]:
+                            if field in record and record.get(field) != display_item.get(field):
+                                changed_fields.add(field)
+                                display_item[field] = record.get(field)
+                with st.container(border=True):
+                    st.markdown(
+                        (
+                            f"**中文：{display_item.get('entity_zh', '')}**  \n"
+                            f"英文：`{display_item.get('entity_en', '')}`  \n"
+                            f"类型：`{display_item.get('type', 'other')}`"
+                        )
+                    )
+                    if pending_update:
+                        st.warning("修改待确认")
+                        if changed_fields:
+                            st.markdown(
+                                f"<span style='color:#f59e0b'>已改动字段：{', '.join(sorted(changed_fields))}</span>",
+                                unsafe_allow_html=True,
+                            )
+                    if pending_delete:
+                        st.error("删除待确认")
+                    st.caption(
+                        "审查状态："
+                        f"中文={display_item.get('synonym_reviewed_zh', False)} | "
+                        f"英文={display_item.get('synonym_reviewed_en', False)}"
+                    )
+                    recommendation = str(display_item.get("final_recommendation", "")).strip()
+                    if recommendation:
+                        st.caption(f"建议：{recommendation}")
+                    st.caption(
+                        f"更新时间：{display_item.get('updated_at', '') or '未知'} | "
+                        f"run_id：{display_item.get('last_run_id', '') or '未知'}"
+                    )
+                    sources = display_item.get("sources", [])
+                    if isinstance(sources, list) and sources:
+                        st.markdown("来源：")
+                        for src in sources:
+                            url = str(src.get("url", "")).strip()
+                            site = str(src.get("site", "")).strip()
+                            note = str(src.get("evidence_note", "")).strip()
+                            if url:
+                                st.markdown(f"- [{site or url}]({url})")
+                            if note:
+                                st.caption(f"证据说明：{note}")
+                    btn_col_1, btn_col_2 = st.columns(2)
+                    with btn_col_1:
+                        with st.popover("修改", disabled=pending_delete):
+                            current_record = pending_update.get("record", {}) if pending_update else display_item
+                            with st.form(key=f"edit_form_{key}"):
+                                new_zh = st.text_input("中文", value=str(current_record.get("entity_zh", "")))
+                                new_en = st.text_input("英文", value=str(current_record.get("entity_en", "")))
+                                new_type = st.text_input("类型", value=str(current_record.get("type", "other")))
+                                new_zh_aliases = st.text_input(
+                                    "中文同义词（逗号分隔）",
+                                    value=", ".join(current_record.get("zh_aliases", [])),
+                                )
+                                new_en_aliases = st.text_input(
+                                    "英文同义词（逗号分隔）",
+                                    value=", ".join(current_record.get("en_aliases", [])),
+                                )
+                                new_recommendation = st.text_area(
+                                    "建议",
+                                    value=str(current_record.get("final_recommendation", "")),
+                                    height=80,
+                                )
+                                new_sources_text = st.text_area(
+                                    "来源（JSON数组）",
+                                    value=json.dumps(current_record.get("sources", []), ensure_ascii=False, indent=2),
+                                    height=140,
+                                )
+                                confirm_edit = st.form_submit_button("确认修改")
+                                if confirm_edit:
+                                    try:
+                                        new_sources = _parse_sources_from_json(new_sources_text)
+                                    except Exception as err:  # pragma: no cover
+                                        st.error(f"来源 JSON 解析失败：{err}")
+                                        new_sources = None
+                                    if new_sources is not None:
+                                        old_idx = _find_pending_index_by_action_key(
+                                            pending_items, "update_record", key
+                                        )
+                                        if old_idx is not None:
+                                            pending_payload = runner.remove_pending_change(old_idx)
+                                            pending_items = pending_payload.get("items", [])
+                                        pending = runner.add_pending_change(
+                                            {
+                                                "id": str(uuid4()),
+                                                "action": "update_record",
+                                                "selector": {"key": key},
+                                                "record": {
+                                                    "entity_zh": new_zh.strip(),
+                                                    "entity_en": new_en.strip(),
+                                                    "type": new_type.strip() or "other",
+                                                    "zh_aliases": [
+                                                        v.strip()
+                                                        for v in new_zh_aliases.split(",")
+                                                        if v.strip()
+                                                    ],
+                                                    "en_aliases": [
+                                                        v.strip()
+                                                        for v in new_en_aliases.split(",")
+                                                        if v.strip()
+                                                    ],
+                                                    "final_recommendation": new_recommendation.strip(),
+                                                    "sources": new_sources,
+                                                    "is_verified": True,
+                                                    "verification_status": "verified",
+                                                },
+                                            }
+                                        )
+                                        st.session_state["pending_changes_snapshot"] = pending
+                                        st.success("已加入修改待确认。")
+                                        st.rerun()
+                    with btn_col_2:
+                        if pending_delete:
+                            if st.button("取消删除", key=f"cancel_delete_{key}"):
+                                idx = _find_pending_index_by_action_key(
+                                    pending_items, "delete_record", key
+                                )
+                                if idx is not None:
+                                    pending = runner.remove_pending_change(idx)
+                                    st.session_state["pending_changes_snapshot"] = pending
+                                    st.success("已取消删除待确认。")
+                                    st.rerun()
+                        else:
+                            if st.button("删除", key=f"mark_delete_{key}"):
+                                pending = runner.add_pending_change(
+                                    {
+                                        "id": str(uuid4()),
+                                        "action": "delete_record",
+                                        "selector": {"key": key},
+                                    }
+                                )
+                                st.session_state["pending_changes_snapshot"] = pending
+                                st.warning("已标记删除待确认。")
+                                st.rerun()
+
+
+def _render_entity_detail_card(title: str, item: dict | None) -> None:
+    st.markdown(f"**{title}**")
+    if not item:
+        st.info("未选择条目。")
+        return
+    with st.container(border=True):
+        st.markdown(
+            f"中文：`{item.get('entity_zh', '')}`  \n"
+            f"英文：`{item.get('entity_en', '')}`  \n"
+            f"类型：`{item.get('type', 'other')}`  \n"
+            f"key：`{item.get('key', '')}`"
+        )
+        st.caption(
+            "同义词状态："
+            f"中文={item.get('synonym_reviewed_zh', False)} | "
+            f"英文={item.get('synonym_reviewed_en', False)}"
+        )
+        st.caption(
+            f"中文同义词：{', '.join(item.get('zh_aliases', [])) or '无'}"
+        )
+        st.caption(
+            f"英文同义词：{', '.join(item.get('en_aliases', [])) or '无'}"
+        )
 
 
 st.title("Blogger Translator")
@@ -214,19 +435,7 @@ def _render_runtime_progress() -> None:
         else "核验进度：等待开始"
     )
     progress_placeholder.progress(min(max(percent / 100.0, 0.0), 1.0))
-    translator_progress = st.session_state.get(
-        "pipeline_translator_progress",
-        {"total_chunks": 0, "current_chunk": 0, "total_retries": 0},
-    )
-    t_total = int(translator_progress.get("total_chunks", 0))
-    t_current = int(translator_progress.get("current_chunk", 0))
-    t_retries = int(translator_progress.get("total_retries", 0))
-    t_text = (
-        f"翻译分块进度：{t_current}/{t_total}，累计重试 {t_retries} 次"
-        if t_total > 0
-        else "翻译分块进度：等待开始"
-    )
-    progress_text_placeholder.caption(f"{text} | {t_text}")
+    progress_text_placeholder.caption(text)
 
     runtime_logs = st.session_state.get("pipeline_runtime_logs", [])
     if runtime_logs:
@@ -253,11 +462,6 @@ if run_all or run_scraper_only or run_until_translator or run_until_verifier:
     live_states = st.session_state.get("pipeline_stage_states", {})
     st.session_state["pipeline_runtime_logs"] = []
     st.session_state["pipeline_verify_progress"] = {"done": 0, "total": 0, "percent": 0.0}
-    st.session_state["pipeline_translator_progress"] = {
-        "total_chunks": 0,
-        "current_chunk": 0,
-        "total_retries": 0,
-    }
     _render_runtime_progress()
 
     def on_stage_update(stage: str, status: str, detail: str) -> None:
@@ -294,38 +498,6 @@ if run_all or run_scraper_only or run_until_translator or run_until_verifier:
         st.session_state["pipeline_runtime_logs"] = logs
         _render_runtime_progress()
 
-    def on_translator_progress(payload: dict) -> None:
-        event = str(payload.get("event", "")).strip()
-        progress = st.session_state.get(
-            "pipeline_translator_progress",
-            {"total_chunks": 0, "current_chunk": 0, "total_retries": 0},
-        )
-        if event == "translator_start":
-            progress["total_chunks"] = int(payload.get("total_chunks", 0))
-            progress["current_chunk"] = 0
-            progress["total_retries"] = 0
-        elif event == "chunk_started":
-            progress["current_chunk"] = int(payload.get("chunk_id", 0))
-            progress["total_chunks"] = int(payload.get("total_chunks", progress.get("total_chunks", 0)))
-        elif event == "chunk_retry":
-            progress["total_retries"] = int(progress.get("total_retries", 0)) + 1
-        elif event == "translator_done":
-            progress["total_chunks"] = int(payload.get("total_chunks", progress.get("total_chunks", 0)))
-        st.session_state["pipeline_translator_progress"] = progress
-
-        message = str(payload.get("message", "")).strip()
-        if message:
-            logs = st.session_state.get("pipeline_runtime_logs", [])
-            logs.append(
-                {
-                    "time": datetime.now().strftime("%H:%M:%S"),
-                    "stage": "translator",
-                    "message": message,
-                }
-            )
-            st.session_state["pipeline_runtime_logs"] = logs
-        _render_runtime_progress()
-
     try:
         with st.spinner("正在执行流水线，请稍候..."):
             result = runner.run_full(
@@ -334,7 +506,6 @@ if run_all or run_scraper_only or run_until_translator or run_until_verifier:
                 options=options,
                 on_stage_update=on_stage_update,
                 on_verifier_progress=on_verifier_progress,
-                on_translator_progress=on_translator_progress,
                 run_until_stage=(
                     "scraper"
                     if run_scraper_only
@@ -388,539 +559,564 @@ with tabs[1]:
     translated = outputs.get("translated", {})
     if translated:
         st.write(f"模型：{translated.get('model', '')}")
-        scraped_for_translate = outputs.get("scraped", {})
-        chunk_metrics = translated.get("chunk_metrics", {})
-        if isinstance(chunk_metrics, dict) and chunk_metrics:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("分块数", int(chunk_metrics.get("total_chunks", 0)))
-            c2.metric("总尝试次数", int(chunk_metrics.get("total_attempts", 0)))
-            c3.metric("总重试次数", int(chunk_metrics.get("total_retries", 0)))
-            c4.metric("截断类重试", int(chunk_metrics.get("truncated_retries", 0)))
-        max_per_chunk = int(
-            (chunk_metrics or {}).get("chunk_max_paragraphs", 5)
-            if isinstance(chunk_metrics, dict)
-            else 5
-        )
-        source_paragraphs = []
-        if isinstance(scraped_for_translate, dict):
-            source_paragraphs = scraped_for_translate.get("body_paragraphs", [])
-        if isinstance(source_paragraphs, list) and source_paragraphs:
-            source_chunks = [
-                source_paragraphs[idx : idx + max_per_chunk]
-                for idx in range(0, len(source_paragraphs), max_per_chunk)
-            ]
-            with st.expander("查看翻译前原文分块", expanded=False):
-                for idx, blocks in enumerate(source_chunks, start=1):
-                    st.markdown(f"**Chunk {idx}/{len(source_chunks)}（{len(blocks)} 段）**")
-                    for pid, paragraph in enumerate(blocks, start=1):
-                        st.write(f"{pid}. {paragraph}")
-        chunk_events = translated.get("chunk_events", [])
-        if isinstance(chunk_events, list) and chunk_events:
-            with st.expander("查看翻译分块/重试明细"):
-                st.json(chunk_events)
-        translated_text_raw = str(translated.get("translated_text", ""))
-        translated_paragraphs: list[str] = []
-        translated_meta: dict = {}
-        try:
-            parsed = json.loads(translated_text_raw)
-            if isinstance(parsed, dict):
-                translation_block = parsed.get("translation", {})
-                if isinstance(translation_block, dict):
-                    translated_meta = {
-                        "title_en": str(translation_block.get("title_en", "")).strip(),
-                        "author_en": str(translation_block.get("author_en", "")).strip(),
-                        "published_at": str(translation_block.get("published_at", "")).strip(),
-                    }
-                    paragraph_list = translation_block.get("paragraphs_en", [])
-                    if isinstance(paragraph_list, list):
-                        translated_paragraphs = [
-                            str(item).strip() for item in paragraph_list if str(item).strip()
-                        ]
-        except json.JSONDecodeError:
-            translated_paragraphs = []
-
-        if not translated_paragraphs:
-            translated_paragraphs = [blk.strip() for blk in translated_text_raw.split("\n\n") if blk.strip()]
-
-        if translated_meta.get("title_en"):
-            st.write(f"标题(EN)：{translated_meta.get('title_en', '')}")
-        if translated_meta.get("author_en"):
-            st.write(f"作者(EN)：{translated_meta.get('author_en', '')}")
-        if translated_meta.get("published_at"):
-            st.write(f"发布时间：{translated_meta.get('published_at', '')}")
-
-        with st.expander("查看分段译文", expanded=True):
-            for idx, paragraph in enumerate(translated_paragraphs, start=1):
-                st.markdown(f"**P{idx}**")
-                st.write(paragraph)
-        with st.expander("查看原始 translated_text JSON", expanded=False):
-            st.text_area("translated_text_raw", translated_text_raw, height=260)
+        st.text_area("translated_text", translated.get("translated_text", ""), height=260)
     else:
         st.info("暂无翻译结果。")
 
 with tabs[2]:
     st.subheader("Verifier 结果")
-    verifier_output = outputs.get("verifier", {})
+    verifier_tab, review_tab, manual_merge_tab, confirm_tab, db_tab = st.tabs(
+        ["本次核验", "大模型审核", "人工合并", "确认修改", "线上词库"]
+    )
 
-    def _append_runtime_log(message: str) -> None:
-        logs = st.session_state.get("pipeline_runtime_logs", [])
-        logs.append(
-            {
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "stage": "verifier",
-                "message": message,
-            }
-        )
-        st.session_state["pipeline_runtime_logs"] = logs
-
-    def _update_outputs_state() -> None:
-        st.session_state["pipeline_stage_outputs"] = outputs
-
-    def _entity_brief(entity: dict) -> str:
-        zh = str(entity.get("entity_zh", "")).strip()
-        en = str(entity.get("entity_en", "")).strip()
-        if zh and en:
-            return f"{zh}/{en}"
-        return zh or en or "unknown"
-
-    def _replace_once_by_candidate(text: str, candidate: dict, replacement: str) -> tuple[str, bool]:
-        start = int(candidate.get("start", -1))
-        end = int(candidate.get("end", -1))
-        matched_text = str(candidate.get("matched_text", ""))
-        term = str(candidate.get("term", ""))
-        if 0 <= start < end <= len(text):
-            current = text[start:end]
-            if current.lower() == matched_text.lower():
-                return text[:start] + replacement + text[end:], True
-        if not term:
-            return text, False
-        pattern = re.compile(rf"(?<!\w){re.escape(term)}(?!\w)", flags=re.IGNORECASE)
-        new_text, replaced = pattern.subn(replacement, text, count=1)
-        return new_text, replaced > 0
-
-    def _apply_replacement(candidate: dict, replacement: str) -> bool:
-        scope = candidate.get("scope")
-        if scope == "translated_text":
-            translated = outputs.get("translated", {})
-            source = str(translated.get("translated_text", ""))
-            updated, changed = _replace_once_by_candidate(source, candidate, replacement)
-            if changed:
-                translated["translated_text"] = updated
-                outputs["translated"] = translated
-                _update_outputs_state()
-            return changed
-
-        if scope == "paragraph_en":
-            paragraph_id = candidate.get("paragraph_id")
-            paragraph_results = verifier_output.get("paragraph_results", [])
-            if not isinstance(paragraph_results, list):
-                return False
-            changed_any = False
-            for item in paragraph_results:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("paragraph_id") != paragraph_id:
-                    continue
-                source = str(item.get("en", ""))
-                updated, changed = _replace_once_by_candidate(source, candidate, replacement)
-                if changed:
-                    item["en"] = updated
-                    changed_any = True
-            if changed_any:
-                pairs = verifier_output.get("paragraph_pairs", [])
-                if isinstance(pairs, list):
-                    for pair in pairs:
-                        if not isinstance(pair, dict):
-                            continue
-                        if pair.get("paragraph_id") == paragraph_id:
-                            source = str(pair.get("en", ""))
-                            updated, changed = _replace_once_by_candidate(source, candidate, replacement)
-                            if changed:
-                                pair["en"] = updated
-                outputs["verifier"] = verifier_output
-                _update_outputs_state()
-            return changed_any
-        return False
-
-    def _mark_entity_saved(paragraph_id: int | str, entity_index: int, saved_payload: dict) -> None:
-        paragraph_results = verifier_output.get("paragraph_results", [])
-        if not isinstance(paragraph_results, list):
-            return
-        for paragraph in paragraph_results:
-            if not isinstance(paragraph, dict):
-                continue
-            if paragraph.get("paragraph_id") != paragraph_id:
-                continue
-            entities = paragraph.get("verified_entities", [])
-            if not isinstance(entities, list) or entity_index >= len(entities):
-                continue
-            entity = entities[entity_index]
-            if not isinstance(entity, dict):
-                continue
-            entity["manual_db_saved"] = True
-            entity["manual_db_saved_at"] = datetime.utcnow().isoformat()
-            entity["sources"] = saved_payload.get("sources", entity.get("sources", []))
-            entity["entity_zh"] = saved_payload.get("entity_zh", entity.get("entity_zh", ""))
-            entity["entity_en"] = saved_payload.get("entity_en", entity.get("entity_en", ""))
-            entity["type"] = saved_payload.get("type", entity.get("type", "other"))
-            entity["final_recommendation"] = saved_payload.get(
-                "final_recommendation", entity.get("final_recommendation", "")
-            )
-            break
-        outputs["verifier"] = verifier_output
-        _update_outputs_state()
-
-    @st.dialog("替换译文（逐条确认）")
-    def _replace_dialog() -> None:
-        target = st.session_state.get("verifier_replace_target")
-        if not isinstance(target, dict):
-            st.info("暂无替换目标。")
-            return
-        entity = target.get("entity", {})
-        if not isinstance(entity, dict):
-            st.info("替换目标数据异常。")
-            return
-
-        default_text = str(entity.get("entity_en", "")).strip()
-        replace_value = st.text_input(
-            "正确译文",
-            value=st.session_state.get("verifier_replace_text", default_text) or default_text,
-            key="verifier_replace_text",
-        ).strip()
-        if not replace_value:
-            st.warning("请先输入正确译文。")
-            return
-
-        translated = outputs.get("translated", {})
-        translated_text = str(translated.get("translated_text", ""))
-        paragraph_results = verifier_output.get("paragraph_results", [])
-        if not isinstance(paragraph_results, list):
-            paragraph_results = []
-        search_terms = build_entity_search_terms(
-            entity_en=str(entity.get("entity_en", "")),
-            entity_type=str(entity.get("type", "other")),
-        )
-        st.caption(f"检索词：{', '.join(search_terms) if search_terms else '(空)'}")
-        candidates = build_replacement_candidates(translated_text, paragraph_results, search_terms)
-        if not candidates:
-            st.info("没有找到可替换项。")
-        for idx, candidate in enumerate(candidates):
-            scope = candidate.get("scope_label", "")
-            context = str(candidate.get("context", ""))
-            matched = str(candidate.get("matched_text", ""))
-            st.markdown(f"**{idx + 1}. {scope}**")
-            st.caption(f"命中：`{matched}`")
-            st.code(context)
-            if st.button("确认替换", key=f"confirm_replace_{idx}_{candidate.get('scope', '')}"):
-                changed = _apply_replacement(candidate, replace_value)
-                if changed:
-                    _append_runtime_log(
-                        f"已替换命中词：{_entity_brief(entity)} -> {replace_value} ({scope})"
+    with verifier_tab:
+        verifier_output = outputs.get("verifier", {})
+        if verifier_output:
+            write_to_db = st.button("确认写入线上映射库", key="write_entity_map_btn")
+            if write_to_db:
+                try:
+                    write_stats = PipelineRunner().write_verified_entities_to_online_db(
+                        run_id=run_id,
+                        verifier_output=verifier_output,
                     )
-                    st.rerun()
-                st.warning("替换失败：命中位置已变化，请重新检查。")
-
-        if st.button("关闭替换窗口", key="close_replace_dialog"):
-            st.session_state["verifier_replace_target"] = None
-            st.session_state.pop("verifier_replace_text", None)
-            st.rerun()
-
-    @st.dialog("录入线上映射库")
-    def _insert_dialog() -> None:
-        target = st.session_state.get("verifier_insert_target")
-        form = st.session_state.get("verifier_insert_form")
-        if not isinstance(target, dict) or not isinstance(form, dict):
-            st.info("暂无录入目标。")
-            return
-
-        st.session_state["insert_entity_zh"] = st.session_state.get(
-            "insert_entity_zh", str(form.get("entity_zh", ""))
-        )
-        st.session_state["insert_entity_en"] = st.session_state.get(
-            "insert_entity_en", str(form.get("entity_en", ""))
-        )
-        st.session_state["insert_entity_type"] = st.session_state.get(
-            "insert_entity_type", str(form.get("type", "other"))
-        )
-        st.session_state["insert_entity_recommendation"] = st.session_state.get(
-            "insert_entity_recommendation", str(form.get("final_recommendation", ""))
-        )
-
-        st.text_input("原文实体（中文）", key="insert_entity_zh")
-        st.text_input("译文实体（英文）", key="insert_entity_en")
-        st.text_input("实体类型", key="insert_entity_type")
-        st.text_area("建议映射/备注", key="insert_entity_recommendation", height=90)
-
-        urls = form.get("sources", [])
-        if not isinstance(urls, list):
-            urls = []
-        form["sources"] = urls
-
-        st.markdown("**验证 URL（可增删）**")
-        for idx, source in enumerate(urls):
-            if not isinstance(source, dict):
-                source = {}
-                urls[idx] = source
-            col_url, col_note, col_del = st.columns([5, 3, 1])
-            url_key = f"insert_url_{idx}"
-            note_key = f"insert_note_{idx}"
-            if url_key not in st.session_state:
-                st.session_state[url_key] = str(source.get("url", ""))
-            if note_key not in st.session_state:
-                st.session_state[note_key] = str(source.get("evidence_note", ""))
-            with col_url:
-                st.text_input(f"URL {idx + 1}", key=url_key, label_visibility="collapsed")
-            with col_note:
-                st.text_input(f"证据说明 {idx + 1}", key=note_key, label_visibility="collapsed")
-            with col_del:
-                if st.button("-", key=f"remove_url_{idx}"):
-                    urls.pop(idx)
-                    st.session_state["verifier_insert_form"] = form
-                    st.rerun()
-
-        if st.button("+ 新增 URL", key="add_insert_url"):
-            urls.append({"url": "", "site": "", "evidence_note": ""})
-            st.session_state["verifier_insert_form"] = form
-            st.rerun()
-
-        if st.button("确认录入线上映射库", type="primary", key="confirm_insert_entity"):
-            payload_sources = []
-            for idx, _ in enumerate(urls):
-                url = str(st.session_state.get(f"insert_url_{idx}", "")).strip()
-                note = str(st.session_state.get(f"insert_note_{idx}", "")).strip()
-                if not url:
-                    continue
-                payload_sources.append({"url": url, "site": "", "evidence_note": note})
-
-            payload = {
-                "entity_zh": str(st.session_state.get("insert_entity_zh", "")).strip(),
-                "entity_en": str(st.session_state.get("insert_entity_en", "")).strip(),
-                "type": str(st.session_state.get("insert_entity_type", "other")).strip() or "other",
-                "is_verified": True,
-                "verification_status": "verified",
-                "sources": payload_sources,
-                "final_recommendation": str(
-                    st.session_state.get("insert_entity_recommendation", "")
-                ).strip(),
-            }
-            try:
-                write_stats = PipelineRunner().upsert_single_entity_to_online_db(
-                    run_id=run_id,
-                    entity=payload,
-                )
-                if int(write_stats.get("upserted", 0)) > 0:
-                    _mark_entity_saved(
-                        paragraph_id=target.get("paragraph_id", ""),
-                        entity_index=int(target.get("entity_index", -1)),
-                        saved_payload=payload,
-                    )
-                    _append_runtime_log(
-                        "手动录入线上映射库成功："
-                        f"{payload.get('entity_zh', '')}/{payload.get('entity_en', '')}"
-                    )
-                    st.success("已录入线上映射库。")
-                    st.session_state["verifier_insert_target"] = None
-                    st.session_state["verifier_insert_form"] = None
-                    st.rerun()
-                else:
-                    st.error("录入失败：至少需要一条有效 URL。")
-            except SettingsError as err:
-                st.error(str(err))
-            except Exception as err:  # pragma: no cover
-                st.exception(err)
-
-        if st.button("关闭录入窗口", key="close_insert_dialog"):
-            st.session_state["verifier_insert_target"] = None
-            st.session_state["verifier_insert_form"] = None
-            st.rerun()
-
-    if verifier_output:
-        write_to_db = st.button("确认写入线上映射库", key="write_entity_map_btn")
-        if write_to_db:
-            try:
-                write_stats = PipelineRunner().write_verified_entities_to_online_db(
-                    run_id=run_id,
-                    verifier_output=verifier_output,
-                )
-                verifier_output["entity_db"] = {
-                    "write_enabled": True,
-                    "scanned": int(write_stats.get("scanned", 0)),
-                    "upserted": int(write_stats.get("upserted", 0)),
-                    "entries": int(write_stats.get("entries", 0)),
-                }
-                outputs["verifier"] = verifier_output
-                _update_outputs_state()
-                _append_runtime_log(
-                    "线上映射库写入完成："
-                    f"扫描 {write_stats.get('scanned', 0)}，"
-                    f"新增/更新 {write_stats.get('upserted', 0)}，"
-                    f"当前总条目 {write_stats.get('entries', 0)}"
-                )
-                _render_runtime_progress()
-                st.success("已按确认写入线上映射库。")
-            except SettingsError as err:
-                st.error(str(err))
-            except Exception as err:  # pragma: no cover
-                st.exception(err)
-        summary = verifier_output.get("summary", {})
-        c1, c2, c3 = st.columns(3)
-        c1.metric("实体总数", int(summary.get("total_entities", 0)))
-        c2.metric("已确认", int(summary.get("verified_entities", 0)))
-        c3.metric("未确认", int(summary.get("unresolved_entities", 0)))
-        degrade_stats = summary.get("degrade_stats", {})
-        if isinstance(degrade_stats, dict):
-            a = int(degrade_stats.get("aligner_fallbacks", 0))
-            b = int(degrade_stats.get("extractor_failures", 0))
-            c = int(degrade_stats.get("verifier_failures", 0))
-            st.caption(
-                "降级统计："
-                f"aligner_fallbacks={a}, "
-                f"extractor_failures={b}, "
-                f"verifier_failures={c}"
-            )
-            if a > 0 or b > 0 or c > 0:
-                st.warning("本次核验触发了降级兜底，请查看日志与降级说明。")
-        entity_db = verifier_output.get("entity_db", {})
-        if isinstance(entity_db, dict) and entity_db:
-            st.caption(
-                "线上映射库："
-                f"write_enabled={entity_db.get('write_enabled', False)}, "
-                f"scanned={entity_db.get('scanned', 0)}, "
-                f"upserted={entity_db.get('upserted', 0)}, "
-                f"entries={entity_db.get('entries', 0)}"
-            )
-
-        notes = verifier_output.get("alignment_notes", [])
-        if notes:
-            with st.expander("段落对齐说明"):
-                st.json(notes)
-        degradation_notes = verifier_output.get("degradation_notes", [])
-        if isinstance(degradation_notes, list) and degradation_notes:
-            with st.expander("核验降级说明"):
-                for note in degradation_notes:
-                    st.write(f"- {note}")
-
-        paragraph_results = verifier_output.get("paragraph_results", [])
-        if isinstance(paragraph_results, list) and paragraph_results:
-            grouped = build_entity_groups(paragraph_results)
-
-            st.markdown("#### LLM 返回实体（可操作）")
-            llm_items = grouped.get("llm", [])
-            if not llm_items:
-                st.info("暂无需要人工处理的 LLM 返回实体。")
-            for row_idx, row in enumerate(llm_items):
-                entity = row.get("entity", {})
-                if not isinstance(entity, dict):
-                    continue
-                paragraph_id = row.get("paragraph_id", "")
-                entity_index = int(row.get("entity_index", -1))
-                with st.container(border=True):
-                    title = _entity_brief(entity)
-                    status = "已确认" if entity.get("is_verified", False) else "未确认"
-                    verification_status = str(entity.get("verification_status", "")).strip()
-                    st.markdown(
-                        f"**{title}** ({entity.get('type', 'other')}) - {status} | 来源：{verification_status or 'llm'}"
-                    )
-                    st.caption(f"段落 p{paragraph_id}")
-                    st.write(f"原文：{row.get('paragraph_zh', '')}")
-                    st.write(f"译文：{row.get('paragraph_en', '')}")
-                    if entity.get("final_recommendation"):
-                        st.write(f"建议：{entity.get('final_recommendation')}")
-                    if entity.get("uncertainty_reason"):
-                        st.warning(f"未确认原因：{entity.get('uncertainty_reason')}")
-                    queries = entity.get("next_search_queries", [])
-                    if isinstance(queries, list) and queries:
-                        st.caption(f"下一步检索建议：{', '.join(str(q) for q in queries)}")
-                    sources = entity.get("sources", [])
-                    if isinstance(sources, list) and sources:
-                        for src in sources:
-                            if not isinstance(src, dict):
-                                continue
-                            url = src.get("url", "")
-                            site = src.get("site", "")
-                            note = src.get("evidence_note", "")
-                            st.markdown(f"- [{site or url}]({url})")
-                            if note:
-                                st.caption(f"证据说明：{note}")
-                    else:
-                        st.caption("未返回可点击证据链接。")
-
-                    left_action, right_action = st.columns(2)
-                    if left_action.button("替换", key=f"entity_replace_{row_idx}_{paragraph_id}_{entity_index}"):
-                        st.session_state["verifier_replace_target"] = row
-                        st.session_state["verifier_replace_text"] = str(entity.get("entity_en", "")).strip()
-                        st.rerun()
-                    if right_action.button("录入", key=f"entity_insert_{row_idx}_{paragraph_id}_{entity_index}"):
-                        seed_sources = entity.get("sources", [])
-                        if not isinstance(seed_sources, list) or not seed_sources:
-                            seed_sources = [{"url": "", "site": "", "evidence_note": ""}]
-                        st.session_state["verifier_insert_target"] = row
-                        st.session_state["verifier_insert_form"] = {
-                            "entity_zh": str(entity.get("entity_zh", "")).strip(),
-                            "entity_en": str(entity.get("entity_en", "")).strip(),
-                            "type": str(entity.get("type", "other")).strip() or "other",
-                            "final_recommendation": str(entity.get("final_recommendation", "")).strip(),
-                            "sources": seed_sources,
+                    verifier_output["entity_db"] = {
+                        "write_enabled": True,
+                        "scanned": int(write_stats.get("scanned", 0)),
+                        "upserted": int(write_stats.get("upserted", 0)),
+                        "entries": int(write_stats.get("entries", 0)),
+                    }
+                    outputs["verifier"] = verifier_output
+                    st.session_state["pipeline_stage_outputs"] = outputs
+                    st.session_state.pop("online_entities_cache", None)
+                    logs = st.session_state.get("pipeline_runtime_logs", [])
+                    logs.append(
+                        {
+                            "time": datetime.now().strftime("%H:%M:%S"),
+                            "stage": "verifier",
+                            "message": (
+                                "线上映射库写入完成："
+                                f"扫描 {write_stats.get('scanned', 0)}，"
+                                f"新增/更新 {write_stats.get('upserted', 0)}，"
+                                f"当前总条目 {write_stats.get('entries', 0)}"
+                            ),
                         }
-                        st.rerun()
-                    if entity.get("manual_db_saved"):
-                        st.success("该实体已手动录入线上映射库。")
+                    )
+                    st.session_state["pipeline_runtime_logs"] = logs
+                    _render_runtime_progress()
+                    st.success("已按确认写入线上映射库。")
+                except SettingsError as err:
+                    st.error(str(err))
+                except Exception as err:  # pragma: no cover
+                    st.exception(err)
+            summary = verifier_output.get("summary", {})
+            c1, c2, c3 = st.columns(3)
+            c1.metric("实体总数", int(summary.get("total_entities", 0)))
+            c2.metric("已确认", int(summary.get("verified_entities", 0)))
+            c3.metric("未确认", int(summary.get("unresolved_entities", 0)))
+            entity_db = verifier_output.get("entity_db", {})
+            if isinstance(entity_db, dict) and entity_db:
+                st.caption(
+                    "线上映射库："
+                    f"write_enabled={entity_db.get('write_enabled', False)}, "
+                    f"scanned={entity_db.get('scanned', 0)}, "
+                    f"upserted={entity_db.get('upserted', 0)}, "
+                    f"entries={entity_db.get('entries', 0)}"
+                )
 
-            def _render_skip_group(group_key: str, title: str) -> None:
-                items = grouped.get(group_key, [])
-                if not items:
-                    return
-                labels = []
-                for item in items:
-                    ent = item.get("entity", {})
-                    if isinstance(ent, dict):
-                        labels.append(_entity_brief(ent))
-                summary = ", ".join(labels) if labels else "无"
-                with st.expander(f"{title}（{len(items)}）: {summary}"):
-                    for item in items:
-                        ent = item.get("entity", {})
-                        if not isinstance(ent, dict):
+            notes = verifier_output.get("alignment_notes", [])
+            if notes:
+                with st.expander("段落对齐说明"):
+                    st.json(notes)
+
+            paragraph_results = verifier_output.get("paragraph_results", [])
+            if paragraph_results:
+                for item in paragraph_results:
+                    paragraph_id = item.get("paragraph_id", "")
+                    with st.expander(f"段落 {paragraph_id}"):
+                        st.caption("中文")
+                        st.write(item.get("zh", ""))
+                        st.caption("英文")
+                        st.write(item.get("en", ""))
+
+                        verified_entities = item.get("verified_entities", [])
+                        if not verified_entities:
+                            st.info("该段未识别到需要核验的实体。")
                             continue
-                        st.markdown(
-                            f"- **p{item.get('paragraph_id', '')}** {_entity_brief(ent)} "
-                            f"| status={ent.get('verification_status', '')}"
-                        )
-                        sources = ent.get("sources", [])
-                        if isinstance(sources, list) and sources:
-                            for src in sources:
-                                if not isinstance(src, dict):
-                                    continue
-                                url = src.get("url", "")
-                                site = src.get("site", "")
-                                note = src.get("evidence_note", "")
-                                st.markdown(f"  - [{site or url}]({url})")
-                                if note:
-                                    st.caption(f"    证据说明：{note}")
-                        else:
-                            st.caption("  - 无可点击 URL")
 
-            st.markdown("#### 跳过项")
-            _render_skip_group("db_exact_hit", "线上映射命中（db_exact_hit）")
-            _render_skip_group("runtime_cache_hit", "运行内缓存命中（runtime_cache_hit）")
-            if st.session_state.get("verifier_replace_target"):
-                _replace_dialog()
-            if st.session_state.get("verifier_insert_target"):
-                _insert_dialog()
+                        for entity in verified_entities:
+                            entity_zh = entity.get("entity_zh", "")
+                            entity_en = entity.get("entity_en", "")
+                            entity_type = entity.get("type", "other")
+                            status = "已确认" if entity.get("is_verified", False) else "未确认"
+                            verification_status = str(entity.get("verification_status", "")).strip()
+                            status_suffix = f" | 来源：{verification_status}" if verification_status else ""
+                            st.markdown(
+                                f"**{entity_zh} / {entity_en}** ({entity_type}) - {status}{status_suffix}"
+                            )
+                            if entity.get("final_recommendation"):
+                                st.write(f"建议：{entity.get('final_recommendation')}")
+                            if entity.get("uncertainty_reason"):
+                                st.warning(f"未确认原因：{entity.get('uncertainty_reason')}")
+                            queries = entity.get("next_search_queries", [])
+                            if queries:
+                                st.caption(f"下一步检索建议：{', '.join(str(q) for q in queries)}")
+                            sources = entity.get("sources", [])
+                            if sources:
+                                for src in sources:
+                                    url = src.get("url", "")
+                                    site = src.get("site", "")
+                                    note = src.get("evidence_note", "")
+                                    st.markdown(f"- [{site or url}]({url})")
+                                    if note:
+                                        st.caption(f"证据说明：{note}")
+                            else:
+                                st.caption("未返回可点击证据链接。")
+            else:
+                st.info("暂无逐段核验结果。")
         else:
-            st.info("暂无逐段核验结果。")
-    else:
-        questions = outputs.get("name_questions", [])
-        if questions:
-            st.info("当前展示兼容模式结果（旧格式）。")
-            for idx, q in enumerate(questions, start=1):
-                st.write(f"{idx}. {q}")
+            questions = outputs.get("name_questions", [])
+            if questions:
+                st.info("当前展示兼容模式结果（旧格式）。")
+                for idx, q in enumerate(questions, start=1):
+                    st.write(f"{idx}. {q}")
+            else:
+                st.info("暂无核验结果。")
+
+    with review_tab:
+        st.caption("按分类 + 语言执行同义词大模型审查，每次只推进一批，支持中断恢复。")
+        runner = PipelineRunner()
+        control_col_1, control_col_2, control_col_3, control_col_4 = st.columns(4)
+        language_mode = control_col_1.selectbox(
+            "审查语言",
+            options=["中文", "英文"],
+            key="synonym_review_language_mode",
+        )
+        language_value = "zh" if language_mode == "中文" else "en"
+        try:
+            all_rows_for_category = runner.list_online_all_entities()
+        except Exception:  # pragma: no cover
+            all_rows_for_category = []
+        category_options = sorted(
+            {str(item.get("type", "other")).strip() or "other" for item in all_rows_for_category}
+        )
+        category = control_col_2.selectbox(
+            "分类",
+            options=category_options or ["other"],
+            key="synonym_review_category",
+        )
+        new_batch_size = int(
+            control_col_3.number_input("新词批大小", min_value=1, max_value=100, value=20, step=1)
+        )
+        reviewed_batch_size = int(
+            control_col_4.number_input("老词批大小", min_value=1, max_value=200, value=50, step=1)
+        )
+        review_model = st.text_input("审查模型（可留空使用侧栏模型）", value=selected_model)
+        run_review = st.button("开始/继续一批大模型审查", key="run_synonym_review_batch")
+        refresh_review_snapshot = st.button("刷新审查进度", key="refresh_synonym_review_snapshot")
+
+        if run_review:
+            try:
+                review_result = runner.run_synonym_review_batch(
+                    language_mode=language_value,
+                    category=category,
+                    llm_model=review_model.strip(),
+                    new_batch_size=new_batch_size,
+                    reviewed_batch_size=reviewed_batch_size,
+                )
+                st.session_state["synonym_review_snapshot"] = {
+                    "state": review_result.get("state", {}),
+                    "results": review_result.get("results", {}),
+                }
+                st.success(str(review_result.get("message", "执行完成。")))
+            except Exception as err:  # pragma: no cover
+                st.exception(err)
+        if refresh_review_snapshot or "synonym_review_snapshot" not in st.session_state:
+            try:
+                snapshot = runner.get_synonym_review_snapshot()
+                st.session_state["synonym_review_snapshot"] = snapshot
+                st.session_state.pop("synonym_review_error", None)
+            except Exception as err:  # pragma: no cover
+                st.session_state["synonym_review_error"] = str(err)
+                st.session_state["synonym_review_snapshot"] = {}
+
+        snapshot_error = st.session_state.get("synonym_review_error")
+        if snapshot_error:
+            st.error(snapshot_error)
+        snapshot = st.session_state.get("synonym_review_snapshot", {})
+        state = snapshot.get("state", {}) if isinstance(snapshot, dict) else {}
+        results_payload = snapshot.get("results", {}) if isinstance(snapshot, dict) else {}
+        st.markdown("#### 当前进度")
+        st.json(state)
+
+        review_rows = results_payload.get("results", [])
+        if isinstance(review_rows, list) and review_rows:
+            latest = review_rows[-1]
+            output = latest.get("output", {}) if isinstance(latest, dict) else {}
+            matches = output.get("matches", []) if isinstance(output, dict) else []
+            st.markdown("#### 最新候选同义词")
+            if matches:
+                for idx, match in enumerate(matches):
+                    if not isinstance(match, dict):
+                        continue
+                    with st.expander(
+                        f"候选 {idx + 1}: {match.get('new_id', '')} -> {match.get('reviewed_id', '')}"
+                    ):
+                        st.write(f"置信度：{match.get('confidence', 'low')}")
+                        st.write(f"依据：{match.get('reason', '')}")
+                        accept_col, reject_col = st.columns(2)
+                        if accept_col.button("接受合并建议", key=f"accept_match_{idx}"):
+                            pending = runner.add_pending_change(
+                                {
+                                    "id": str(uuid4()),
+                                    "action": "merge_records",
+                                    "language_mode": language_value,
+                                    "target_selector": {"key": str(match.get("reviewed_id", ""))},
+                                    "source_selector": {"key": str(match.get("new_id", ""))},
+                                    "reason": str(match.get("reason", "")),
+                                }
+                            )
+                            st.session_state["pending_changes_snapshot"] = pending
+                            st.success("已加入待处理条目（未写线上库）。")
+                        if reject_col.button("拒绝并标记已审查", key=f"reject_match_{idx}"):
+                            pending = runner.add_pending_change(
+                                {
+                                    "id": str(uuid4()),
+                                    "action": "mark_reviewed",
+                                    "language_mode": language_value,
+                                    "selector": {"key": str(match.get("new_id", ""))},
+                                    "reason": str(match.get("reason", "")),
+                                }
+                            )
+                            st.session_state["pending_changes_snapshot"] = pending
+                            st.success("已加入待处理条目（未写线上库）。")
+            else:
+                st.info("本批没有返回同义词候选。")
+            if st.button("将当前批新词标记为已人工审查（不合并）", key="mark_current_batch_reviewed"):
+                new_keys = (
+                    state.get("active", {}).get("new_keys", [])
+                    if isinstance(state.get("active", {}), dict)
+                    else []
+                )
+                if not isinstance(new_keys, list) or not new_keys:
+                    st.warning("当前没有可标记的新词批。")
+                else:
+                    for item_key in new_keys:
+                        runner.add_pending_change(
+                            {
+                                "id": str(uuid4()),
+                                "action": "mark_reviewed",
+                                "language_mode": language_value,
+                                "selector": {"key": str(item_key)},
+                                "reason": "manual_mark_reviewed_without_merge",
+                            }
+                        )
+                    st.success("已加入待处理条目（未写线上库）。")
         else:
-            st.info("暂无核验结果。")
+            st.info("暂无审查结果。")
+
+    with manual_merge_tab:
+        st.caption("人工补充合并：左右各选一条，先模拟合并，再确认写入待处理条目。")
+        runner = PipelineRunner()
+        refresh_manual = st.button("刷新线上条目", key="refresh_manual_merge_entities")
+        if refresh_manual or "manual_merge_entities" not in st.session_state:
+            try:
+                st.session_state["manual_merge_entities"] = runner.list_online_all_entities()
+                st.session_state.pop("manual_merge_error", None)
+            except Exception as err:  # pragma: no cover
+                st.session_state["manual_merge_error"] = str(err)
+                st.session_state["manual_merge_entities"] = []
+        manual_err = st.session_state.get("manual_merge_error")
+        if manual_err:
+            st.error(manual_err)
+        all_entities = st.session_state.get("manual_merge_entities", [])
+        if not isinstance(all_entities, list):
+            all_entities = []
+        categories = sorted({str(item.get("type", "other")) for item in all_entities if isinstance(item, dict)})
+
+        left_col, right_col = st.columns(2)
+        with left_col:
+            st.markdown("#### 内容1筛选器")
+            c1 = st.selectbox("分类", options=["全部"] + categories, key="merge_filter_left_category")
+            z1 = st.text_input("中文关键词", key="merge_filter_left_zh")
+            e1 = st.text_input("英文关键词", key="merge_filter_left_en")
+            s1 = st.selectbox("新/老/全部", options=["全部", "新内容", "老内容"], key="merge_filter_left_scope")
+            search1 = st.button("搜索内容1", key="search_merge_left")
+            if search1:
+                filtered1 = _filter_online_entities(
+                    rows=[item for item in all_entities if isinstance(item, dict)],
+                    search_field="entity_zh",
+                    keyword=z1,
+                    category=c1,
+                    review_scope=s1,
+                )
+                if e1.strip():
+                    filtered1 = _filter_online_entities(
+                        rows=filtered1,
+                        search_field="entity_en",
+                        keyword=e1,
+                        category="全部",
+                        review_scope="全部",
+                    )
+                st.session_state["merge_left_results"] = filtered1
+            left_results = st.session_state.get("merge_left_results", [])
+            left_labels = [
+                f"{idx + 1}. {item.get('entity_zh', '')} / {item.get('entity_en', '')}"
+                for idx, item in enumerate(left_results)
+            ]
+            selected_left_idx = st.selectbox(
+                "内容1结果",
+                options=list(range(len(left_labels))),
+                format_func=lambda i: left_labels[i] if left_labels else "无结果",
+                key="merge_left_selected_idx",
+            ) if left_labels else None
+            selected_left_item = left_results[selected_left_idx] if selected_left_idx is not None else None
+            _render_entity_detail_card("内容1详情", selected_left_item)
+
+        with right_col:
+            st.markdown("#### 内容2筛选器")
+            c2 = st.selectbox("分类", options=["全部"] + categories, key="merge_filter_right_category")
+            z2 = st.text_input("中文关键词", key="merge_filter_right_zh")
+            e2 = st.text_input("英文关键词", key="merge_filter_right_en")
+            s2 = st.selectbox("新/老/全部", options=["全部", "新内容", "老内容"], key="merge_filter_right_scope")
+            search2 = st.button("搜索内容2", key="search_merge_right")
+            if search2:
+                filtered2 = _filter_online_entities(
+                    rows=[item for item in all_entities if isinstance(item, dict)],
+                    search_field="entity_zh",
+                    keyword=z2,
+                    category=c2,
+                    review_scope=s2,
+                )
+                if e2.strip():
+                    filtered2 = _filter_online_entities(
+                        rows=filtered2,
+                        search_field="entity_en",
+                        keyword=e2,
+                        category="全部",
+                        review_scope="全部",
+                    )
+                st.session_state["merge_right_results"] = filtered2
+            right_results = st.session_state.get("merge_right_results", [])
+            right_labels = [
+                f"{idx + 1}. {item.get('entity_zh', '')} / {item.get('entity_en', '')}"
+                for idx, item in enumerate(right_results)
+            ]
+            selected_right_idx = st.selectbox(
+                "内容2结果",
+                options=list(range(len(right_labels))),
+                format_func=lambda i: right_labels[i] if right_labels else "无结果",
+                key="merge_right_selected_idx",
+            ) if right_labels else None
+            selected_right_item = right_results[selected_right_idx] if selected_right_idx is not None else None
+            _render_entity_detail_card("内容2详情", selected_right_item)
+
+        st.markdown("#### 合并策略")
+        keep_col_1, keep_col_2, keep_col_3, keep_col_4 = st.columns(4)
+        keep_zh = keep_col_1.checkbox("保留中文", value=True, key="merge_keep_zh")
+        keep_en = keep_col_2.checkbox("保留英文", value=True, key="merge_keep_en")
+        keep_url = keep_col_3.checkbox("保留URL", value=False, key="merge_keep_url")
+        keep_note = keep_col_4.checkbox("保留Note", value=False, key="merge_keep_note")
+        preview_merge = st.button("合并（模拟）", key="preview_manual_merge")
+        if preview_merge:
+            if not selected_left_item or not selected_right_item:
+                st.warning("请先在左右两侧各选择一个条目。")
+            else:
+                merged = {
+                    "entity_zh": selected_right_item.get("entity_zh", ""),
+                    "entity_en": selected_right_item.get("entity_en", ""),
+                    "type": selected_right_item.get("type", "other"),
+                    "zh_aliases": sorted(
+                        set(selected_right_item.get("zh_aliases", []))
+                        | (set(selected_left_item.get("zh_aliases", [])) if keep_zh else set())
+                    ),
+                    "en_aliases": sorted(
+                        set(selected_right_item.get("en_aliases", []))
+                        | (set(selected_left_item.get("en_aliases", [])) if keep_en else set())
+                    ),
+                    "sources": selected_right_item.get("sources", [])
+                    + (selected_left_item.get("sources", []) if keep_url or keep_note else []),
+                    "final_recommendation": selected_right_item.get("final_recommendation", ""),
+                    "is_verified": True,
+                    "verification_status": "verified",
+                    "synonym_reviewed_zh": True,
+                    "synonym_reviewed_en": True,
+                }
+                st.session_state["manual_merge_preview"] = {
+                    "source": selected_left_item,
+                    "target": selected_right_item,
+                    "merged": merged,
+                }
+        preview_payload = st.session_state.get("manual_merge_preview")
+        if isinstance(preview_payload, dict):
+            st.markdown("#### 模拟合并结果")
+            _render_entity_detail_card("合并后条目", preview_payload.get("merged"))
+            action_col_1, action_col_2 = st.columns(2)
+            if action_col_1.button("返回", key="cancel_manual_merge_preview"):
+                st.session_state.pop("manual_merge_preview", None)
+                st.rerun()
+            if action_col_2.button("确认", key="confirm_manual_merge_preview"):
+                source_item = preview_payload.get("source", {})
+                target_item = preview_payload.get("target", {})
+                pending = runner.add_pending_change(
+                    {
+                        "id": str(uuid4()),
+                        "action": "merge_records",
+                        "language_mode": "zh",
+                        "source_selector": {"key": str(source_item.get("key", ""))},
+                        "target_selector": {"key": str(target_item.get("key", ""))},
+                        "record": preview_payload.get("merged", {}),
+                        "reason": "manual_merge_confirmed",
+                    }
+                )
+                st.session_state["pending_changes_snapshot"] = pending
+                st.success("已加入待处理条目（未写线上库）。")
+                st.session_state.pop("manual_merge_preview", None)
+
+    with confirm_tab:
+        st.caption("此处只处理待处理条目；点击发送才会真正写入线上数据库。")
+        runner = PipelineRunner()
+        refresh_pending = st.button("刷新待处理条目", key="refresh_pending_changes")
+        if refresh_pending or "pending_changes_snapshot" not in st.session_state:
+            try:
+                snapshot = runner.get_synonym_review_snapshot()
+                st.session_state["pending_changes_snapshot"] = snapshot.get("pending", {})
+                st.session_state.pop("pending_changes_error", None)
+            except Exception as err:  # pragma: no cover
+                st.session_state["pending_changes_error"] = str(err)
+                st.session_state["pending_changes_snapshot"] = {"items": []}
+        pending_error = st.session_state.get("pending_changes_error")
+        if pending_error:
+            st.error(pending_error)
+        pending_payload = st.session_state.get("pending_changes_snapshot", {})
+        pending_items = pending_payload.get("items", []) if isinstance(pending_payload, dict) else []
+        if not isinstance(pending_items, list):
+            pending_items = []
+        st.metric("待处理条目数", len(pending_items))
+        for idx, item in enumerate(pending_items):
+            if not isinstance(item, dict):
+                continue
+            action = str(item.get("action", ""))
+            status = str(item.get("status", "pending"))
+            title = f"{idx + 1}. {action} | status={status}"
+            selector = item.get("selector", {})
+            if action in {"update_record", "delete_record"} and isinstance(selector, dict):
+                title += f" | key={selector.get('key', '')}"
+            with st.expander(
+                title
+            ):
+                if action == "update_record":
+                    st.caption("修改待确认")
+                elif action == "delete_record":
+                    st.caption("删除待确认")
+                elif action == "merge_records":
+                    st.caption("合并待确认")
+                st.json(item)
+                if st.button("删除此条", key=f"delete_pending_{idx}"):
+                    try:
+                        new_pending = runner.remove_pending_change(idx)
+                        st.session_state["pending_changes_snapshot"] = new_pending
+                        st.success("已删除。")
+                        st.rerun()
+                    except Exception as err:  # pragma: no cover
+                        st.exception(err)
+        if st.button("发送到线上数据库", type="primary", key="apply_pending_changes"):
+            try:
+                result = runner.apply_pending_changes_to_online_db(run_id=run_id or "manual_db_update")
+                st.success(
+                    "线上数据库更新完成："
+                    f"applied={result.get('applied', 0)}, "
+                    f"skipped={result.get('skipped', 0)}"
+                )
+                st.caption(f"audit_log: {result.get('audit_log_path', '')}")
+                snapshot = runner.get_synonym_review_snapshot()
+                st.session_state["pending_changes_snapshot"] = snapshot.get("pending", {})
+                st.session_state.pop("online_entities_cache", None)
+                st.session_state.pop("online_entities_error", None)
+            except Exception as err:  # pragma: no cover
+                st.exception(err)
+
+    with db_tab:
+        st.caption("展示线上 `name_map/entity_map_v1.json` 词条，并可发起修改/删除待确认。")
+        runner = PipelineRunner()
+        if "pending_changes_snapshot" not in st.session_state:
+            try:
+                snapshot = runner.get_synonym_review_snapshot()
+                st.session_state["pending_changes_snapshot"] = snapshot.get("pending", {"items": []})
+            except Exception:  # pragma: no cover
+                st.session_state["pending_changes_snapshot"] = {"items": []}
+        pending_payload = st.session_state.get("pending_changes_snapshot", {})
+        pending_items = pending_payload.get("items", []) if isinstance(pending_payload, dict) else []
+        if not isinstance(pending_items, list):
+            pending_items = []
+        refresh_cols = st.columns([1, 1, 3])
+        refresh_clicked = refresh_cols[0].button("刷新线上词库", key="refresh_online_entities")
+        reset_filter_clicked = refresh_cols[1].button("重置筛选", key="reset_online_entity_filters")
+        if reset_filter_clicked:
+            st.session_state["online_entity_search_mode"] = "中文"
+            st.session_state["online_entity_keyword"] = ""
+            st.session_state["online_entity_category"] = "全部"
+            st.session_state["online_entity_review_scope"] = "全部"
+            st.rerun()
+
+        if refresh_clicked or "online_entities_cache" not in st.session_state:
+            try:
+                st.session_state["online_entities_cache"] = runner.list_online_verified_entities()
+                st.session_state.pop("online_entities_error", None)
+            except SettingsError as err:
+                st.session_state["online_entities_error"] = str(err)
+                st.session_state["online_entities_cache"] = []
+            except Exception as err:  # pragma: no cover
+                st.session_state["online_entities_error"] = str(err)
+                st.session_state["online_entities_cache"] = []
+
+        online_error = st.session_state.get("online_entities_error")
+        if online_error:
+            st.error(online_error)
+        else:
+            online_rows = st.session_state.get("online_entities_cache", [])
+            categories = sorted(
+                {
+                    str(item.get("type", "other")).strip() or "other"
+                    for item in online_rows
+                    if isinstance(item, dict)
+                }
+            )
+            search_mode = st.radio(
+                "搜索字段",
+                options=["中文", "英文"],
+                horizontal=True,
+                key="online_entity_search_mode",
+            )
+            search_field = "entity_zh" if search_mode == "中文" else "entity_en"
+            keyword = st.text_input("关键词", key="online_entity_keyword")
+            selected_category = st.selectbox(
+                "分类",
+                options=["全部"] + categories,
+                index=0,
+                key="online_entity_category",
+            )
+            review_scope = st.selectbox(
+                "新/老/全部",
+                options=["全部", "新内容", "老内容"],
+                index=0,
+                key="online_entity_review_scope",
+            )
+
+            filtered_rows = _filter_online_entities(
+                rows=[item for item in online_rows if isinstance(item, dict)],
+                search_field=search_field,
+                keyword=keyword,
+                category=selected_category,
+                review_scope=review_scope,
+            )
+            metric_col_1, metric_col_2 = st.columns(2)
+            metric_col_1.metric("当前筛选结果", len(filtered_rows))
+            metric_col_2.metric("线上总词条", len(online_rows))
+            _render_online_entity_cards(filtered_rows, pending_items=pending_items, runner=runner)
 
 with tabs[3]:
     st.subheader("Revisor 结果")
     revised = outputs.get("revised", {})
-    scraped = outputs.get("scraped", {})
     if revised:
         st.write(f"模型：{revised.get('model', '')}")
         st.write(
@@ -930,66 +1126,7 @@ with tabs[3]:
         note = revised.get("placeholder_note") or revised.get("mock_note")
         if note:
             st.caption(note)
-
-        revision_block = revised.get("revision", {})
-        if not isinstance(revision_block, dict):
-            revision_block = {}
-        title_revised = str(revision_block.get("title_revised_en", "")).strip()
-        if title_revised:
-            st.markdown(f"**润色标题**：{title_revised}")
-
-        pairs, parts = _build_revisor_pairs(scraped if isinstance(scraped, dict) else {}, revised)
-        if pairs:
-            st.markdown("#### 分段对照（译文 / 原文）")
-            for part in parts:
-                if not isinstance(part, dict):
-                    continue
-                part_id = int(part.get("part_id", 0))
-                subtitle = str(part.get("subtitle_en", "")).strip()
-                title = f"Part {part_id}" if part_id > 0 else "Part"
-                if subtitle:
-                    st.markdown(f"##### {title}: {subtitle}")
-                else:
-                    st.markdown(f"##### {title}")
-                paragraph_ids = part.get("paragraph_ids", [])
-                if not isinstance(paragraph_ids, list):
-                    continue
-                for paragraph_id in paragraph_ids:
-                    try:
-                        pid = int(paragraph_id)
-                    except (TypeError, ValueError):
-                        continue
-                    if not (1 <= pid <= len(pairs)):
-                        continue
-                    row = pairs[pid - 1]
-                    with st.container(border=True):
-                        st.caption(f"段落 p{pid}")
-                        col_en, col_zh = st.columns(2)
-                        with col_en:
-                            st.markdown("**译文**")
-                            st.write(row.get("en", ""))
-                        with col_zh:
-                            st.markdown("**原文**")
-                            st.write(row.get("zh", "") or "（缺失原文段落）")
-        else:
-            st.info("暂无可分段展示的润色结果。")
-
-        with st.expander("查看 merged revised_text"):
-            st.text_area("revised_text", revised.get("revised_text", ""), height=220)
-
-        captions = _as_text_list(revision_block.get("captions_revised_en", []))
-        if captions:
-            with st.expander("查看润色 captions"):
-                for idx, cap in enumerate(captions, start=1):
-                    st.write(f"{idx}. {cap}")
-
-        with st.expander("查看 revision_meta / revision_outline"):
-            st.json(
-                {
-                    "revision_meta": revised.get("revision_meta", {}),
-                    "revision_outline": revised.get("revision_outline", {}),
-                }
-            )
+        st.text_area("revised_text", revised.get("revised_text", ""), height=300)
     else:
         st.info("暂无润色结果。")
 
