@@ -249,6 +249,31 @@
 - 在 translator 分支评估“程序切段翻译 + 分块重试 + 最终拼装”方案，与 revisor 分段策略保持编号对齐。
 - 为 verifier 的降级计数增加长期监控指标（按 run_id 聚合），用于观察模型稳定性趋势与回归预警。
 
+## 2026-03-20（Storage/Streamlit：同义词审查、人工合并与待确认改库）
+
+日期时间：2026-03-20  
+分支：`feature/firebase-storage`  
+完成项：
+- verifier 与线上映射交互改为“严格同义词集合命中”路径：移除 `db_alias_hit` 宽松回退，新增 `db_synonym_hit`，并保留精确命中短路。
+- 扩展 `entity_map` 记录结构：新增 `zh_aliases`、`en_aliases`、`synonym_reviewed_zh`、`synonym_reviewed_en`、`created_at` 兼容回填。
+- 新增 review 持久化：`name_map/review/review_state.json`、`review_results.json`、`pending_changes.json`，支持中断恢复与继续执行。
+- 新增同义词审查 prompt 与阶段实现：`Verifier_Synonym_Review_Prompt.md`、`SynonymReviewStage`，按“分类 + 语言 + 批次”执行 LLM 审查。
+- Streamlit 数据库区升级为 5 个子页签：`本次核验`、`大模型审核`、`人工合并`、`确认修改`、`线上词库`。
+- `线上词库` 卡片新增“修改/删除”动作：修改进入 `update_record` 待确认，删除进入 `delete_record` 待确认，支持“取消删除”回退。
+- `确认修改` 页签支持折叠展示待确认动作（合并/修改/删除），仅在“发送到线上数据库”时批量落库并写审计日志。
+- 修复人工合并落库行为：合并后删除 source 旧词条，避免线上词库继续显示两条历史记录。
+- 处理并解决与 `origin/main` 的冲突文件（`pipeline_runner.py`、`streamlit_app.py`、`revision_stage.py`、`test_repository_entity_map.py`），保留数据库治理能力并兼容主干最新 revisor/translator 链路。
+验证结果：
+- 语法检查通过：`python -m py_compile src/storage/repositories.py src/app/pipeline_runner.py src/verifier/synonym_review_stage.py src/verifier/verify_stage.py src/app/streamlit_app.py src/revisor/revision_stage.py tests/test_repository_entity_map.py`。
+- 单测通过：`pytest -q tests/test_repository_entity_map.py tests/test_revision_stage.py tests/test_translate_stage.py`（12 passed）。
+- 追加改动后回归通过：`pytest -q tests/test_repository_entity_map.py`（5 passed）。
+- 分支已推送并创建 PR：`feature/firebase-storage` -> `main`（PR #12）；冲突修复后再次推送，PR 进入可继续 review 状态。
+阻塞项：
+- Streamlit Cloud 部署仍需通过平台 Secrets 注入环境变量与 Firebase 凭据 JSON，当前仓库未内置自动落地 secrets 到凭据文件的部署适配层。
+下一步：
+- 在目标部署环境补充 Secrets 映射与启动自检（LLM key、bucket、credentials）后执行一次真实端到端联调。
+- 视人工运营需求补充“变更 diff 预览”和“按动作类型过滤待确认列表”，提升大批量人工审核效率。
+
 ## 记录模板
 
 ```
