@@ -20,6 +20,12 @@ from app.mock_pipeline import (
 )
 from app.ui_state import STAGE_ORDER, make_empty_stage_states
 from config.settings import SettingsError
+from formatter.byline_resolver import (
+    fallback_short_title,
+    needs_title_shorten,
+    resolve_bylines,
+    safe_docx_name,
+)
 from formatter.docx_formatter import DocxFormatter
 from revisor.revision_stage import RevisionStage
 from scraper.bastille_scraper import BastilleScraper
@@ -124,6 +130,7 @@ class PipelineRunner:
 
         try:
             scraped = self._run_scraper(url, options, emit)
+            run_id = new_mock_run_id(str(scraped.get("title", "")))
             stage_outputs["scraped"] = scraped
             self._maybe_stop("scraper", should_stop_after, stage_states)
 
@@ -152,7 +159,15 @@ class PipelineRunner:
             self._maybe_stop("revisor", should_stop_after, stage_states)
 
             output_file = self._run_formatter(
-                run_id, output_dir, scraped, revised, emit, options.mock_fail_stage
+                run_id,
+                output_dir,
+                scraped,
+                translated,
+                revised,
+                emit,
+                options.mock_fail_stage,
+                options.use_real_llm,
+                options.llm_model,
             )
             artifacts["docx_local_path"] = str(output_file)
             self._maybe_stop("formatter", should_stop_after, stage_states)
@@ -377,26 +392,46 @@ class PipelineRunner:
         run_id: str,
         output_dir: str | Path,
         scraped: dict,
+        translated: dict,
         revised: dict,
         emit: Callable,
         fail_stage: str,
+        use_real_llm: bool,
+        llm_model: str,
     ) -> Path:
         emit("formatter", "running", "正在生成 docx...")
         self._maybe_fail("formatter", fail_stage)
-        if revised.get("model", "").startswith("mock-"):
-            output_file = build_mock_docx(output_dir, run_id, scraped, revised)
-            emit("formatter", "mocked", "使用 mock 文本生成 docx")
-            return output_file
-        output_file = Path(output_dir) / f"{run_id}.docx"
         revision_block = revised.get("revision", {})
         if not isinstance(revision_block, dict):
             revision_block = {}
+        translated_meta = self._extract_translated_meta(translated)
+        if revised.get("model", "").startswith("mock-"):
+            output_file = build_mock_docx(output_dir, run_id, scraped, revised, translated)
+            emit("formatter", "mocked", "使用 mock 文本生成 docx")
+            return output_file
+        byline = resolve_bylines(
+            scraped_author=str(scraped.get("author", "")),
+            scraped_title=str(scraped.get("title", "")),
+        )
+        title_en = str(revision_block.get("title_revised_en", "")).strip() or str(
+            translated_meta.get("title_en", "")
+        ).strip()
+        if not title_en:
+            title_en = str(scraped.get("title", "")).strip()
+        title_en = self._shorten_title_if_needed(
+            title_en=title_en,
+            use_real_llm=use_real_llm,
+            llm_model=llm_model,
+        )
+        filename = safe_docx_name(title=title_en, fallback=run_id)
+        output_file = Path(output_dir) / filename
         DocxFormatter().build(
             output_path=output_file,
-            title_en=str(revision_block.get("title_revised_en", "")).strip() or f"{scraped.get('title', '')}",
-            author_en=scraped.get("author", ""),
+            title_en=title_en,
+            header_byline_en=byline.get("header_line_en", ""),
             body_blocks=self._build_formatter_body_blocks(scraped, revised),
-            ending_author_zh=scraped.get("author", ""),
+            ending_author_en=byline.get("ending_author_en", ""),
+            ending_column_en=byline.get("ending_column_en", ""),
             captions_blocks=self._build_formatter_captions(scraped, revised),
         )
         emit("formatter", "success", "docx 已生成")
@@ -610,11 +645,13 @@ class PipelineRunner:
             if idx in subtitle_map:
                 blocks.append(subtitle_map[idx])
             source_zh = source_paragraphs[idx - 1] if idx - 1 < len(source_paragraphs) else ""
-            pair_lines = [f"译文：{revised_en}"]
+            blocks.append(revised_en)
             if source_zh:
-                pair_lines.append(f"原文：{source_zh}")
-            blocks.append("\n".join(pair_lines).strip())
+                blocks.append(source_zh)
+            blocks.append("")
         if blocks:
+            while blocks and not blocks[-1].strip():
+                blocks.pop()
             return blocks
         fallback = str(revised.get("revised_text", "")).strip()
         return [fallback] if fallback else []
@@ -635,6 +672,63 @@ class PipelineRunner:
         if not isinstance(value, list):
             return []
         return [str(item).strip() for item in value if str(item).strip()]
+
+    @staticmethod
+    def _extract_translated_meta(translated: dict) -> dict[str, str]:
+        raw = str(translated.get("translated_text", "")).strip()
+        if not raw:
+            return {"title_en": "", "author_en": ""}
+        try:
+            payload = TranslateStage._extract_json_object(raw)  # pylint: disable=protected-access
+        except Exception:
+            payload = None
+        if not isinstance(payload, dict):
+            return {"title_en": "", "author_en": ""}
+        translation = payload.get("translation", {})
+        if not isinstance(translation, dict):
+            return {"title_en": "", "author_en": ""}
+        return {
+            "title_en": str(translation.get("title_en", "")).strip(),
+            # byline is mapping-driven from scraped metadata; do not trust LLM author text.
+            "author_en": "",
+        }
+
+    def _shorten_title_if_needed(self, title_en: str, use_real_llm: bool, llm_model: str) -> str:
+        title = str(title_en).strip()
+        if not needs_title_shorten(title, max_words=10):
+            return title
+        if use_real_llm:
+            try:
+                env = self._load_runtime_env(model_override=llm_model)
+                self._validate_llm_env(env)
+                client = SiliconFlowClient(
+                    api_key=env["SILICONFLOW_API_KEY"],
+                    base_url=env["SILICONFLOW_BASE_URL"],
+                    model=env["SILICONFLOW_MODEL"],
+                    timeout=env["SILICONFLOW_TIMEOUT_SECONDS"],
+                    max_retries=1,
+                )
+                prompt = (
+                    "Rewrite the following article title to be shorter and punchier.\n"
+                    "Constraints:\n"
+                    "- Keep the original stance and key meaning.\n"
+                    "- Output ONE line only.\n"
+                    "- Maximum 10 words.\n\n"
+                    f"Title: {title}"
+                )
+                shorter = str(
+                    client.chat(
+                        system_prompt="You write concise, punchy English news headlines.",
+                        user_prompt=prompt,
+                        temperature=0.2,
+                    )
+                ).strip()
+                shorter = shorter.replace('"', "").replace("'", "").strip()
+                if shorter and not needs_title_shorten(shorter, max_words=10):
+                    return shorter
+            except Exception:
+                pass
+        return fallback_short_title(title, max_words=10)
 
     def write_verified_entities_to_online_db(self, run_id: str, verifier_output: dict) -> dict[str, int]:
         env = self._load_runtime_env()
@@ -862,3 +956,153 @@ class PipelineRunner:
         self._validate_storage_env(env)
         repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
         return repo.upsert_single_verified_entity(run_id=run_id, entity=entity)
+
+    def list_recent_runs(self, limit: int = 10) -> list[dict]:
+        env = self._load_runtime_env()
+        self._validate_storage_env(env)
+        repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
+        return repo.list_recent_run_logs(limit=limit)
+
+    def load_run_detail(self, run_id: str, log_blob_path: str = "") -> dict:
+        env = self._load_runtime_env()
+        self._validate_storage_env(env)
+        repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
+        return repo.load_run_detail(run_id=run_id, log_blob_path=log_blob_path)
+
+    def stage_verified_entities_as_pending(self, run_id: str, verifier_output: dict) -> dict[str, int]:
+        env = self._load_runtime_env()
+        self._validate_storage_env(env)
+        repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
+        scanned = 0
+        staged = 0
+        repo_pending = repo.load_pending_changes()
+        items = repo_pending.get("items", [])
+        if not isinstance(items, list):
+            items = []
+        paragraph_results = verifier_output.get("paragraph_results", [])
+        if not isinstance(paragraph_results, list):
+            return {"scanned": 0, "staged": 0}
+        for paragraph in paragraph_results:
+            if not isinstance(paragraph, dict):
+                continue
+            verified_entities = paragraph.get("verified_entities", [])
+            if not isinstance(verified_entities, list):
+                continue
+            for entity in verified_entities:
+                if not isinstance(entity, dict):
+                    continue
+                scanned += 1
+                if not bool(entity.get("is_verified", False)):
+                    continue
+                pending = {
+                    "id": f"{run_id}_{scanned}",
+                    "action": "upsert_record",
+                    "selector": {
+                        "entity_zh": str(entity.get("entity_zh", "")).strip(),
+                        "entity_en": str(entity.get("entity_en", "")).strip(),
+                        "type": str(entity.get("type", "other")).strip() or "other",
+                    },
+                    "record": {
+                        "entity_zh": str(entity.get("entity_zh", "")).strip(),
+                        "entity_en": str(entity.get("entity_en", "")).strip(),
+                        "type": str(entity.get("type", "other")).strip() or "other",
+                        "is_verified": True,
+                        "verification_status": "verified",
+                        "sources": entity.get("sources", []) if isinstance(entity.get("sources", []), list) else [],
+                        "final_recommendation": str(entity.get("final_recommendation", "")).strip(),
+                    },
+                    "reason": "stage_from_verifier_review",
+                    "saved_at": datetime.utcnow().isoformat(),
+                    "status": "pending",
+                }
+                items.append(pending)
+                staged += 1
+        repo_pending["items"] = items
+        repo.save_pending_changes(repo_pending)
+        return {"scanned": scanned, "staged": staged}
+
+    def rebuild_run_docx(
+        self,
+        run_id: str,
+        scraped: dict,
+        translated: dict,
+        revised: dict,
+        llm_model: str = "",
+        output_dir: str | Path = "outputs",
+    ) -> dict[str, str]:
+        revision_block = revised.get("revision", {})
+        if not isinstance(revision_block, dict):
+            revision_block = {}
+        translated_meta = self._extract_translated_meta(translated)
+        byline = resolve_bylines(
+            scraped_author=str(scraped.get("author", "")),
+            scraped_title=str(scraped.get("title", "")),
+        )
+        title_en = str(revision_block.get("title_revised_en", "")).strip() or str(
+            translated_meta.get("title_en", "")
+        ).strip()
+        if not title_en:
+            title_en = str(scraped.get("title", "")).strip()
+        title_en = self._shorten_title_if_needed(
+            title_en=title_en,
+            use_real_llm=False,
+            llm_model=llm_model,
+        )
+        filename = safe_docx_name(title=title_en, fallback=run_id)
+        output_file = Path(output_dir) / filename
+        DocxFormatter().build(
+            output_path=output_file,
+            title_en=title_en,
+            header_byline_en=byline.get("header_line_en", ""),
+            body_blocks=self._build_formatter_body_blocks(scraped, revised),
+            ending_author_en=byline.get("ending_author_en", ""),
+            ending_column_en=byline.get("ending_column_en", ""),
+            captions_blocks=self._build_formatter_captions(scraped, revised),
+        )
+
+        env = self._load_runtime_env()
+        self._validate_storage_env(env)
+        repo = RunRepository(FirebaseStorageClient(bucket_name=env["FIREBASE_STORAGE_BUCKET"]))
+        repo.save_revision(run_id, revised)
+        cloud_path = repo.save_output_docx(run_id, str(output_file))
+        return {"docx_local_path": str(output_file), "docx_cloud_path": cloud_path}
+
+    def build_local_run_docx(
+        self,
+        run_id: str,
+        scraped: dict,
+        translated: dict,
+        revised: dict,
+        llm_model: str = "",
+        output_dir: str | Path = "outputs",
+    ) -> dict[str, str]:
+        revision_block = revised.get("revision", {})
+        if not isinstance(revision_block, dict):
+            revision_block = {}
+        translated_meta = self._extract_translated_meta(translated)
+        byline = resolve_bylines(
+            scraped_author=str(scraped.get("author", "")),
+            scraped_title=str(scraped.get("title", "")),
+        )
+        title_en = str(revision_block.get("title_revised_en", "")).strip() or str(
+            translated_meta.get("title_en", "")
+        ).strip()
+        if not title_en:
+            title_en = str(scraped.get("title", "")).strip()
+        title_en = self._shorten_title_if_needed(
+            title_en=title_en,
+            use_real_llm=False,
+            llm_model=llm_model,
+        )
+        filename = safe_docx_name(title=title_en, fallback=run_id)
+        output_file = Path(output_dir) / filename
+        DocxFormatter().build(
+            output_path=output_file,
+            title_en=title_en,
+            header_byline_en=byline.get("header_line_en", ""),
+            body_blocks=self._build_formatter_body_blocks(scraped, revised),
+            ending_author_en=byline.get("ending_author_en", ""),
+            ending_column_en=byline.get("ending_column_en", ""),
+            captions_blocks=self._build_formatter_captions(scraped, revised),
+        )
+        return {"docx_local_path": str(output_file), "docx_cloud_path": ""}

@@ -274,6 +274,29 @@
 - 在目标部署环境补充 Secrets 映射与启动自检（LLM key、bucket、credentials）后执行一次真实端到端联调。
 - 视人工运营需求补充“变更 diff 预览”和“按动作类型过滤待确认列表”，提升大批量人工审核效率。
 
+## 2026-03-21（Streamlit：任务级本地草稿、分离文档同步、历史检索按需渲染）
+
+日期时间：2026-03-21  
+分支：`feature/firebase-storage`  
+完成项：
+- 任务选择器上移至主界面 Tabs 上方，支持“当前运行 / 历史任务”全局切换，所有 Tabs 按当前选中任务统一渲染。
+- Verifier 段落展示改为“LLM 核验主卡片 + runtime/database 命中分层展示”，段落标题显示动态计数（runtime/database/verified/unverified，0 不显示）。
+- 修复 Streamlit 嵌套 `expander` 异常（`Expanders may not be nested inside other expanders`），替换为单层容器结构，避免 UI 渲染崩溃。
+- 新增任务本地草稿机制：按 `run_id` 将 `scraped/translated/revised/verifier/artifacts` 持久化到 `outputs/task_drafts/*.json`，核验“替换/修改”先作用本地草稿。
+- 新增文档同步队列：核验编辑后自动重建本地 docx 并加入“文档同步待确认”，不再每次编辑即时写线上文档。
+- “确认修改”拆分为“数据库同步（pending_changes）”与“文档同步（runs 文档覆盖）”两块，用户确认后才批量同步线上。
+- 增加切任务提醒：若存在数据库或文档未同步项，切换任务时提示先到“确认修改”完成同步。
+- “历史修改检索（已处理）”改为按需渲染：默认仅展示搜索 UI；仅在点击“搜索”后渲染结果，并限制最多展示 50 条，降低交互卡顿。
+验证结果：
+- `python -m py_compile src/app/streamlit_app.py src/app/pipeline_runner.py` 通过。
+- `ReadLints` 检查通过（改动文件无新增 lint）。
+- 本地运行确认：队列任务可执行，原先 `expander` 嵌套报错已消除。
+阻塞项：
+- 长文核验卡片仍存在较多 widgets；在低性能环境下仍可能出现重渲染开销，后续可进一步改为表格+按需详情。
+下一步：
+- 增加“仅同步当前选中任务文档”按钮，避免批量任务场景一次全量同步。
+- 为历史检索补充分页/排序，进一步减少一次性渲染成本与交互抖动。
+
 ## 记录模板
 
 ```

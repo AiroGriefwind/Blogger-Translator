@@ -4,8 +4,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 import uuid
+from zoneinfo import ZoneInfo
 
 from config.settings import Settings
+from formatter.byline_resolver import (
+    fallback_short_title,
+    needs_title_shorten,
+    resolve_bylines,
+    safe_docx_name,
+)
 from formatter.docx_formatter import DocxFormatter
 from revisor.revision_stage import RevisionStage
 from scraper.bastille_scraper import BastilleScraper
@@ -107,16 +114,29 @@ class PipelineOrchestrator:
 
             active_step = "format"
             active_step_started_at = self._step_running(run_log, active_step)
-            output_file = Path(output_dir) / f"{run_id}.docx"
             revision_block = revised.get("revision", {})
             if not isinstance(revision_block, dict):
                 revision_block = {}
+            translated_meta = self._extract_translated_meta(translated)
+            byline = resolve_bylines(
+                scraped_author=str(scraped.get("author", "")),
+                scraped_title=str(scraped.get("title", "")),
+            )
+            title_en = str(revision_block.get("title_revised_en", "")).strip() or str(
+                translated_meta.get("title_en", "")
+            ).strip()
+            if not title_en:
+                title_en = str(scraped.get("title", "")).strip()
+            title_en = self._shorten_title_if_needed(title_en)
+            filename = safe_docx_name(title=title_en, fallback=run_id)
+            output_file = Path(output_dir) / filename
             self.formatter.build(
                 output_path=output_file,
-                title_en=str(revision_block.get("title_revised_en", "")).strip() or f"{scraped.get('title', '')}",
-                author_en=scraped.get("author", ""),
+                title_en=title_en,
+                header_byline_en=byline.get("header_line_en", ""),
                 body_blocks=self._build_formatter_body_blocks(scraped, revised),
-                ending_author_zh=scraped.get("author", ""),
+                ending_author_en=byline.get("ending_author_en", ""),
+                ending_column_en=byline.get("ending_column_en", ""),
                 captions_blocks=self._build_formatter_captions(scraped, revised),
             )
             run_log["artifacts"]["docx_local_path"] = str(output_file)
@@ -154,9 +174,16 @@ class PipelineOrchestrator:
         return result
 
     @staticmethod
-    def _new_run_id() -> str:
-        ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-        return f"{ts}_{uuid.uuid4().hex[:8]}"
+    def _new_run_id(source_title: str = "") -> str:
+        ts = datetime.now(tz=ZoneInfo("Asia/Hong_Kong")).strftime("%Y%m%d%H%M%S")
+        prefix = "".join(
+            ch
+            for ch in str(source_title).strip()
+            if ch not in '<>:"/\\|?*' and (ch.isalnum() or ("\u4e00" <= ch <= "\u9fff"))
+        )[:6]
+        if not prefix:
+            prefix = "untitl"
+        return f"{prefix}_{ts}_{uuid.uuid4().hex[:8]}"
 
     @staticmethod
     def _utc_now() -> datetime:
@@ -282,11 +309,13 @@ class PipelineOrchestrator:
             if idx in subtitle_map:
                 blocks.append(subtitle_map[idx])
             source_zh = source_paragraphs[idx - 1] if idx - 1 < len(source_paragraphs) else ""
-            pair_lines = [f"译文：{revised_en}"]
+            blocks.append(revised_en)
             if source_zh:
-                pair_lines.append(f"原文：{source_zh}")
-            blocks.append("\n".join(pair_lines).strip())
+                blocks.append(source_zh)
+            blocks.append("")
         if blocks:
+            while blocks and not blocks[-1].strip():
+                blocks.pop()
             return blocks
         fallback = str(revised.get("revised_text", "")).strip()
         return [fallback] if fallback else []
@@ -307,4 +336,51 @@ class PipelineOrchestrator:
         if not isinstance(value, list):
             return []
         return [str(item).strip() for item in value if str(item).strip()]
+
+    @staticmethod
+    def _extract_translated_meta(translated: dict[str, Any]) -> dict[str, str]:
+        raw = str(translated.get("translated_text", "")).strip()
+        if not raw:
+            return {"title_en": "", "author_en": ""}
+        try:
+            payload = TranslateStage._extract_json_object(raw)  # pylint: disable=protected-access
+        except Exception:
+            payload = None
+        if not isinstance(payload, dict):
+            return {"title_en": "", "author_en": ""}
+        translation = payload.get("translation", {})
+        if not isinstance(translation, dict):
+            return {"title_en": "", "author_en": ""}
+        return {
+            "title_en": str(translation.get("title_en", "")).strip(),
+            # byline is mapping-driven from scraped metadata; do not trust LLM author text.
+            "author_en": "",
+        }
+
+    def _shorten_title_if_needed(self, title_en: str) -> str:
+        title = str(title_en).strip()
+        if not needs_title_shorten(title, max_words=10):
+            return title
+        try:
+            prompt = (
+                "Rewrite the following article title to be shorter and punchier.\n"
+                "Constraints:\n"
+                "- Keep the original stance and key meaning.\n"
+                "- Output ONE line only.\n"
+                "- Maximum 10 words.\n\n"
+                f"Title: {title}"
+            )
+            shorter = str(
+                self.client.chat(
+                    system_prompt="You write concise, punchy English news headlines.",
+                    user_prompt=prompt,
+                    temperature=self.settings.siliconflow_temperature,
+                )
+            ).strip()
+            shorter = shorter.replace('"', "").replace("'", "").strip()
+            if shorter and not needs_title_shorten(shorter, max_words=10):
+                return shorter
+        except Exception:
+            pass
+        return fallback_short_title(title, max_words=10)
 

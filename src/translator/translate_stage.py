@@ -37,6 +37,7 @@ class TranslateStage:
         system_prompt = CHUNK_PROMPT_FILE.read_text(encoding="utf-8")
         chunk_outputs: list[dict[str, Any]] = []
         chunk_events: list[dict[str, Any]] = []
+        http_retry_events: list[dict[str, Any]] = []
         total_attempts = 0
         total_chunks = len(chunks)
         self._emit_progress(
@@ -71,6 +72,27 @@ class TranslateStage:
                     "message": f"开始翻译 chunk {index}/{total_chunks}（{len(chunk_paragraphs)} 段）。",
                 },
             )
+            def on_http_retry(payload: dict[str, Any]) -> None:
+                attempt = int(payload.get("attempt", 0))
+                status = payload.get("status")
+                wait_seconds = float(payload.get("wait_seconds", 0.0))
+                reason = str(payload.get("reason", "")).strip() or "retry"
+                event = {
+                    "event": "http_retry_backoff",
+                    "chunk_id": index,
+                    "total_chunks": total_chunks,
+                    "attempt": attempt,
+                    "status": status,
+                    "wait_seconds": wait_seconds,
+                    "reason": reason,
+                    "message": (
+                        f"chunk {index}/{total_chunks} 限流退避：第 {attempt} 次重试，"
+                        f"等待 {wait_seconds:.1f}s（{reason}）"
+                    ),
+                }
+                http_retry_events.append(event)
+                self._emit_progress(on_progress, event)
+
             chunk_payload, attempt_count, retry_count, retry_reasons = self._chat_chunk_with_retry(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
@@ -79,6 +101,7 @@ class TranslateStage:
                 total_chunks=total_chunks,
                 include_meta=include_meta,
                 on_progress=on_progress,
+                on_http_retry=on_http_retry,
             )
             total_attempts += attempt_count
             chunk_outputs.append(chunk_payload)
@@ -139,7 +162,7 @@ class TranslateStage:
             "model": self.client.model,
             "translated_text": json.dumps(assembled, ensure_ascii=False),
             "chunk_metrics": metrics,
-            "chunk_events": chunk_events,
+            "chunk_events": [*chunk_events, *http_retry_events],
         }
 
     def _run_single_call(
@@ -157,6 +180,23 @@ class TranslateStage:
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             temperature=self.temperature,
+            on_retry=lambda payload: self._emit_progress(
+                on_progress,
+                {
+                    "event": "http_retry_backoff",
+                    "chunk_id": 1,
+                    "total_chunks": 1,
+                    "attempt": int(payload.get("attempt", 0)),
+                    "status": payload.get("status"),
+                    "wait_seconds": float(payload.get("wait_seconds", 0.0)),
+                    "reason": str(payload.get("reason", "")).strip(),
+                    "message": (
+                        "翻译限流退避："
+                        f"第 {int(payload.get('attempt', 0))} 次重试，"
+                        f"等待 {float(payload.get('wait_seconds', 0.0)):.1f}s"
+                    ),
+                },
+            ),
         )
         self._emit_progress(
             on_progress,
@@ -193,6 +233,7 @@ class TranslateStage:
         total_chunks: int,
         include_meta: bool,
         on_progress: Callable[[dict[str, Any]], None] | None = None,
+        on_http_retry: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[dict[str, Any], int, int, list[str]]:
         last_error: Exception | None = None
         retry_reasons: list[str] = []
@@ -208,6 +249,7 @@ class TranslateStage:
                 system_prompt=system_prompt,
                 user_prompt=prompt,
                 temperature=self.temperature,
+                on_retry=on_http_retry,
             )
             try:
                 parsed = self._parse_chunk_output(
@@ -321,7 +363,8 @@ class TranslateStage:
         payload = {
             "title": article.get("title", ""),
             "published_at": article.get("published_at", ""),
-            "author": article.get("author", ""),
+            # Author/column translation is mapping-driven downstream; do not ask LLM to translate it.
+            "author": "",
             "paragraphs": article.get("body_paragraphs", []),
             "captions": article.get("captions", []),
         }
@@ -340,7 +383,8 @@ class TranslateStage:
             "total_chunks": total_chunks,
             "title": article.get("title", "") if include_meta else "",
             "published_at": article.get("published_at", "") if include_meta else "",
-            "author": article.get("author", "") if include_meta else "",
+            # Author/column translation is mapping-driven downstream; do not ask LLM to translate it.
+            "author": "",
             "paragraphs": chunk_paragraphs,
             "captions": article.get("captions", []) if include_meta else [],
         }

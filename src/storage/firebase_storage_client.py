@@ -40,3 +40,15 @@ class FirebaseStorageClient:
         blob.upload_from_filename(str(local_file))
         return f"gs://{self.bucket.name}/{blob_path}"
 
+    def list_blobs(self, prefix: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for blob in self.client.list_blobs(self.bucket, prefix=prefix):
+            rows.append(
+                {
+                    "path": str(blob.name),
+                    "updated_at": blob.updated.isoformat() if blob.updated else "",
+                    "size": int(blob.size or 0),
+                }
+            )
+        return rows
+

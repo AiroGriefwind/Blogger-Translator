@@ -45,6 +45,7 @@ If no caption exists in input, return an empty array.
 - Mark Pinkstone -> 彭仕敦／香港政府新聞處前總新聞主任
 - SD Advocates -> 持續智庫
 - What Say You? -> 時人物語
+- Lai Ting-yiu -> 黎廷瑤
 - Deep Throat -> 深喉
 - Mao Paishou -> 毛拍手
 - Bastille Commentary -> 巴士的點評

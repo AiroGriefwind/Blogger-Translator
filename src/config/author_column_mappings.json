@@ -1,0 +1,42 @@
+{
+  "columns": [
+    {
+      "en": "Bastille Commentary",
+      "aliases": ["巴士的點評", "Bastille Commentary"]
+    },
+    {
+      "en": "What Say You?",
+      "aliases": ["時人物語", "What Say You?"]
+    },
+    {
+      "en": "Double Standards Decoder",
+      "aliases": ["雙標研究所", "Double Standards Decoder"]
+    },
+    {
+      "en": "SD Advocates",
+      "aliases": ["持續智庫", "SD Advocates"]
+    },
+    {
+      "en": "Deep Throat",
+      "aliases": ["深喉", "Deep Throat"]
+    }
+  ],
+  "authors": [
+    {
+      "en": "Mark Pinkstone",
+      "aliases": ["彭仕敦", "Mark Pinkstone"]
+    },
+    {
+      "en": "Lai Ting-yiu",
+      "aliases": ["黎廷瑤", "Lai Ting-yiu"]
+    },
+    {
+      "en": "Mao Paishou",
+      "aliases": ["毛拍手", "Mao Paishou"]
+    },
+    {
+      "en": "Lo Wing-hung",
+      "aliases": ["盧永雄", "Lo Wing-hung"]
+    }
+  ]
+}
