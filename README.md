@@ -1,6 +1,6 @@
 # Blogger Translator
 
-从巴士的报文章 URL 出发，自动完成抓取、翻译、润色、标题/Caption 长度控制、`docx` 排版导出，并归档到 Firebase Storage。
+从文章 URL 出发，自动完成抓取、翻译、润色、标题/Caption 长度控制、`docx` 排版导出，并归档到 Firebase Storage。
 
 ## Quick Start
 
