@@ -2,14 +2,33 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import json
 import uuid
+from zoneinfo import ZoneInfo
 
+from formatter.byline_resolver import (
+    fallback_short_title,
+    needs_title_shorten,
+    resolve_bylines,
+    safe_docx_name,
+)
 from formatter.docx_formatter import DocxFormatter
 
 
-def new_mock_run_id() -> str:
-    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    return f"mock_{ts}_{uuid.uuid4().hex[:8]}"
+def new_mock_run_id(source_title: str = "") -> str:
+    ts = datetime.now(tz=ZoneInfo("Asia/Hong_Kong")).strftime("%Y%m%d%H%M%S")
+    prefix = _title_prefix(source_title)
+    return f"{prefix}_{ts}_{uuid.uuid4().hex[:8]}"
+
+
+def _title_prefix(source_title: str, limit: int = 6) -> str:
+    cleaned = "".join(ch for ch in str(source_title).strip() if ch not in '<>:"/\\|?*')
+    cleaned = "".join(ch for ch in cleaned if ch.isalnum() or ("\u4e00" <= ch <= "\u9fff"))
+    if cleaned.lower().startswith("mock"):
+        cleaned = cleaned[4:]
+    if not cleaned:
+        return "untitl"
+    return cleaned[:limit]
 
 
 def build_mock_scraped(url: str) -> dict:
@@ -53,6 +72,7 @@ def build_mock_translated(article: dict) -> dict:
 
 
 def build_mock_revised(article: dict, translation: dict) -> dict:
+    mock_title_en = "Trump the Sanctions Magician: Igniting Oil Prices, Then Cooling Them with Russian Crude"
     paragraphs = [
         "Energy prices whipsawed as conflicting policy signals hit the market.",
         "Traders quickly repriced risk after fresh supply narratives emerged.",
@@ -61,7 +81,7 @@ def build_mock_revised(article: dict, translation: dict) -> dict:
         "model": "mock-deepseek-r1",
         "schema_version": "2.0",
         "revision": {
-            "title_revised_en": article.get("title", ""),
+            "title_revised_en": mock_title_en,
             "paragraphs_revised_en": paragraphs,
             "captions_revised_en": article.get("captions", []),
             "subtitles_en": [{"insert_before_paragraph": 1, "subtitle": "Market Shock And Repricing"}],
@@ -76,7 +96,7 @@ def build_mock_revised(article: dict, translation: dict) -> dict:
         "revision_outline": {
             "schema_version": "1.0",
             "total_paragraphs": 2,
-            "title_revised_en": article.get("title", ""),
+            "title_revised_en": mock_title_en,
             "entity_mapping_used": True,
             "parts": [
                 {
@@ -190,8 +210,25 @@ def build_mock_verifier_output() -> dict:
     }
 
 
-def build_mock_docx(output_dir: str | Path, run_id: str, article: dict, revised: dict) -> Path:
-    output_file = Path(output_dir) / f"{run_id}.docx"
+def build_mock_docx(
+    output_dir: str | Path,
+    run_id: str,
+    article: dict,
+    revised: dict,
+    translated: dict | None = None,
+) -> Path:
+    translated = translated if isinstance(translated, dict) else {}
+    translated_title_en = ""
+    translated_text = str(translated.get("translated_text", "")).strip()
+    if translated_text:
+        try:
+            payload = json.loads(translated_text)
+        except json.JSONDecodeError:
+            payload = {}
+        translation = payload.get("translation", {}) if isinstance(payload, dict) else {}
+        if isinstance(translation, dict):
+            translated_title_en = str(translation.get("title_en", "")).strip()
+
     formatter = DocxFormatter()
     revision_block = revised.get("revision", {})
     if not isinstance(revision_block, dict):
@@ -205,20 +242,34 @@ def build_mock_docx(output_dir: str | Path, run_id: str, article: dict, revised:
     body_blocks: list[str] = []
     for idx, paragraph_en in enumerate(revised_paragraphs, start=1):
         paragraph_zh = source_paragraphs[idx - 1] if idx - 1 < len(source_paragraphs) else ""
-        pair_lines = [f"译文：{paragraph_en}"]
+        body_blocks.append(paragraph_en)
         if paragraph_zh:
-            pair_lines.append(f"原文：{paragraph_zh}")
-        body_blocks.append("\n".join(pair_lines).strip())
+            body_blocks.append(paragraph_zh)
+        body_blocks.append("")
     if not body_blocks:
         fallback = str(revised.get("revised_text", "")).strip()
         body_blocks = [fallback] if fallback else []
+    else:
+        while body_blocks and not body_blocks[-1].strip():
+            body_blocks.pop()
+    byline = resolve_bylines(
+        scraped_author=str(article.get("author", "")),
+        scraped_title=str(article.get("title", "")),
+    )
+
+    title_en = str(revision_block.get("title_revised_en", "")).strip() or article.get("title", "")
+    if needs_title_shorten(title_en, max_words=10):
+        title_en = fallback_short_title(title_en, max_words=10)
+    filename = safe_docx_name(title=title_en or translated_title_en, fallback=run_id)
+    output_file = Path(output_dir) / filename
 
     formatter.build(
         output_path=output_file,
-        title_en=str(revision_block.get("title_revised_en", "")).strip() or article.get("title", ""),
-        author_en=article.get("author", ""),
+        title_en=title_en,
+        header_byline_en=byline.get("header_line_en", ""),
         body_blocks=body_blocks,
-        ending_author_zh=article.get("author", ""),
+        ending_author_en=byline.get("ending_author_en", ""),
+        ending_column_en=byline.get("ending_column_en", ""),
         captions_blocks=revision_block.get("captions_revised_en", []) or article.get("captions", []),
     )
     return output_file

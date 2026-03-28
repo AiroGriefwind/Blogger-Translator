@@ -460,6 +460,130 @@ class RunRepository:
     def save_output_docx(self, run_id: str, local_docx_path: str) -> str:
         return self.storage.upload_file(f"runs/{run_id}/output/final.docx", local_docx_path)
 
+    def list_recent_run_logs(self, limit: int = 10) -> list[dict[str, Any]]:
+        limit = max(int(limit), 1)
+        by_run: dict[str, dict[str, Any]] = {}
+
+        # Source A: canonical run logs under logs/{date}/{run_id}.json
+        log_blob_rows = self.storage.list_blobs(prefix="logs/")
+        log_json_rows = [
+            row for row in log_blob_rows if str(row.get("path", "")).endswith(".json")
+        ]
+        log_json_rows.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
+        for row in log_json_rows:
+            blob_path = str(row.get("path", "")).strip()
+            if not blob_path:
+                continue
+            payload = self.storage.download_json(blob_path)
+            if not isinstance(payload, dict):
+                continue
+            run_id = str(payload.get("run_id", "")).strip()
+            if not run_id:
+                continue
+            date_key = str(payload.get("date_key", "")).strip()
+            url = str(payload.get("url", "")).strip()
+            overall_status = str(payload.get("overall_status", "")).strip() or "unknown"
+            started_at = str(payload.get("started_at", "")).strip()
+            ended_at = str(payload.get("ended_at", "")).strip()
+            steps = payload.get("steps", {})
+            if not isinstance(steps, dict):
+                steps = {}
+            updated_at = str(row.get("updated_at", ""))
+            existing = by_run.get(run_id)
+            if existing and str(existing.get("log_updated_at", "")) >= updated_at:
+                continue
+            by_run[run_id] = {
+                "run_id": run_id,
+                "date_key": date_key,
+                "url": url,
+                "overall_status": overall_status,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "steps": steps,
+                "log_blob_path": blob_path,
+                "log_updated_at": updated_at,
+            }
+
+        # Source B: run directories under runs/{run_id}/...
+        # This captures newer Streamlit/PipelineRunner runs even when logs/{date}/{run_id}.json is absent.
+        run_blob_rows = self.storage.list_blobs(prefix="runs/")
+        run_latest_updated: dict[str, str] = {}
+        for row in run_blob_rows:
+            path = str(row.get("path", "")).strip()
+            if not path:
+                continue
+            parts = path.split("/")
+            if len(parts) < 2:
+                continue
+            run_id = parts[1].strip()
+            if not run_id:
+                continue
+            updated_at = str(row.get("updated_at", ""))
+            previous = run_latest_updated.get(run_id, "")
+            if updated_at > previous:
+                run_latest_updated[run_id] = updated_at
+
+        for run_id, updated_at in run_latest_updated.items():
+            if run_id in by_run:
+                # Enrich sort key with newer timestamp if runs tree is fresher.
+                if updated_at > str(by_run[run_id].get("log_updated_at", "")):
+                    by_run[run_id]["log_updated_at"] = updated_at
+                    if not str(by_run[run_id].get("ended_at", "")).strip():
+                        by_run[run_id]["ended_at"] = updated_at
+                continue
+            by_run[run_id] = {
+                "run_id": run_id,
+                "date_key": "",
+                "url": "",
+                "overall_status": "unknown",
+                "started_at": "",
+                "ended_at": updated_at,
+                "steps": {},
+                "log_blob_path": "",
+                "log_updated_at": updated_at,
+            }
+
+        results = list(by_run.values())
+        results.sort(key=lambda item: str(item.get("log_updated_at", "")), reverse=True)
+        return results[:limit]
+
+    def load_run_detail(self, run_id: str, log_blob_path: str = "") -> dict[str, Any]:
+        run_log: dict[str, Any] = {}
+        if log_blob_path.strip():
+            maybe = self.storage.download_json(log_blob_path.strip())
+            if isinstance(maybe, dict):
+                run_log = maybe
+        if not run_log:
+            date_key = datetime.now(tz=timezone.utc).strftime("%Y%m%d")
+            maybe = self.storage.download_json(f"logs/{date_key}/{run_id}.json")
+            if isinstance(maybe, dict):
+                run_log = maybe
+
+        verifier = self.storage.download_json(f"runs/{run_id}/logs/verifier_entities.json")
+        if not isinstance(verifier, dict):
+            verifier = {}
+        name_questions = self.storage.download_json(f"runs/{run_id}/logs/name_questions.json")
+        if not isinstance(name_questions, dict):
+            name_questions = {"questions": []}
+        raw_article = self.storage.download_json(f"runs/{run_id}/raw/article.json")
+        if not isinstance(raw_article, dict):
+            raw_article = {}
+        translated = self.storage.download_json(f"runs/{run_id}/translated/translated.json")
+        if not isinstance(translated, dict):
+            translated = {}
+        revised = self.storage.download_json(f"runs/{run_id}/revised/revised.json")
+        if not isinstance(revised, dict):
+            revised = {}
+        return {
+            "run_log": run_log,
+            "verifier": verifier,
+            "name_questions": name_questions.get("questions", []),
+            "raw_article": raw_article,
+            "translated": translated,
+            "revised": revised,
+            "docx_cloud_path": f"gs://{self.storage.bucket.name}/runs/{run_id}/output/final.docx",
+        }
+
     @staticmethod
     def _empty_entity_map() -> dict[str, Any]:
         return {

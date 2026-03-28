@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import random
 import re
 import time
+from typing import Callable
 from typing import Any
 
 import requests
@@ -16,7 +18,13 @@ class SiliconFlowClient:
     timeout: int = 120
     max_retries: int = 2
 
-    def chat(self, system_prompt: str, user_prompt: str, temperature: float = 0.2) -> str:
+    def chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.2,
+        on_retry: Callable[[dict[str, Any]], None] | None = None,
+    ) -> str:
         url = f"{self.base_url.rstrip('/')}/chat/completions"
         payload: dict[str, Any] = {
             "model": self.model,
@@ -44,13 +52,36 @@ class SiliconFlowClient:
                 if not should_retry or attempt >= self.max_retries:
                     raise
                 last_error = exc
+                wait_seconds = self._compute_backoff_seconds(attempt=attempt, response=exc.response)
+                if on_retry:
+                    on_retry(
+                        {
+                            "attempt": attempt + 1,
+                            "status": status,
+                            "wait_seconds": wait_seconds,
+                            "reason": f"http_{status}",
+                            "url": url,
+                        }
+                    )
+                time.sleep(wait_seconds)
+                continue
             except (requests.Timeout, requests.ConnectionError) as exc:
                 if attempt >= self.max_retries:
                     raise
                 last_error = exc
-
-            # 轻量退避，避免瞬时网络抖动导致整个阶段失败。
-            time.sleep(min(2 * (attempt + 1), 8))
+                wait_seconds = self._compute_backoff_seconds(attempt=attempt, response=None)
+                if on_retry:
+                    on_retry(
+                        {
+                            "attempt": attempt + 1,
+                            "status": None,
+                            "wait_seconds": wait_seconds,
+                            "reason": exc.__class__.__name__.lower(),
+                            "url": url,
+                        }
+                    )
+                time.sleep(wait_seconds)
+                continue
 
         if last_error is not None:
             raise last_error
@@ -64,4 +95,20 @@ class SiliconFlowClient:
         if "</think>" in cleaned:
             cleaned = cleaned.split("</think>")[-1].strip()
         return cleaned
+
+    @staticmethod
+    def _compute_backoff_seconds(attempt: int, response: requests.Response | None) -> float:
+        if response is not None:
+            retry_after = response.headers.get("Retry-After", "").strip()
+            if retry_after:
+                try:
+                    wait = float(retry_after)
+                    if wait > 0:
+                        return min(wait, 30.0)
+                except ValueError:
+                    pass
+        # Exponential backoff with jitter.
+        base = min(2 ** (attempt + 1), 16)
+        jitter = random.uniform(0.0, 1.5)
+        return min(base + jitter, 30.0)
 
